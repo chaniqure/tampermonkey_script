@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Quake360 结果 URL 提取与过滤
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
-// @description  提取 quake 搜索结果中的标题与 URL，支持多页抓取、可用性检测与表格导出
+// @version      1.4.1
+// @description  提取 quake 搜索结果中的标题与 URL，支持多页抓取、可用性检测与表格导出，支持跳过指定 URL 的校验
 // @author       you
 // @match        *://quake.360.net/*
 // @match        *://quake.360.cn/*
@@ -53,6 +53,8 @@
         availabilityTimeoutMs: 5000,
         maxCheckCount: 80,
         checkConcurrency: 4,
+        // 跳过校验的正则：匹配 URL 的正则，匹配成功则跳过校验（如纯 IP:port 类型）
+        checkSkipRegex: '',
         visibleColumns: DEFAULT_VISIBLE_COLUMNS,
         copyColumns: DEFAULT_COPY_COLUMNS,
         unavailableKeywords: [
@@ -105,8 +107,13 @@
         }
         r.includeRegex = String(r.includeRegex || '');
         r.excludeRegex = String(r.excludeRegex || '');
+        r.checkSkipRegex = String(r.checkSkipRegex || '');
         r.resultLinkSelector = String(r.resultLinkSelector || DEFAULT_RULES.resultLinkSelector).trim() || DEFAULT_RULES.resultLinkSelector;
         r.nextPageSelector = String(r.nextPageSelector || DEFAULT_RULES.nextPageSelector).trim() || DEFAULT_RULES.nextPageSelector;
+        // 处理 checkSkipRegex 为数组形式（支持多行）
+        if (Array.isArray(r.checkSkipRegex)) {
+            r.checkSkipRegex = r.checkSkipRegex.filter(Boolean).join('\n');
+        }
 
         return r;
     };
@@ -236,7 +243,8 @@
         },
         footer: {
             display: 'flex', gap: '8px', justifyContent: 'flex-end',
-            padding: '12px 16px', borderTop: '1px solid #eee', background: '#fff'
+            padding: '12px 16px', borderTop: '1px solid #eee', background: '#fff',
+            position: 'sticky', bottom: '0', zIndex: '10'
         },
         tableWrap: {
             overflow: 'auto', maxHeight: '62vh', borderBottom: '1px solid #eee'
@@ -582,6 +590,24 @@
     async function checkBatch(records, r, mode = 'concurrent', onProgress = null, onRowResult = null, onCancel = null, fetchTitle = false) {
         const limit = r.maxCheckCount > 0 ? Math.min(records.length, r.maxCheckCount) : records.length;
         const target = records.slice(0, limit);
+
+        // 处理跳过校验的正则过滤（支持多行，每行一个正则）
+        const skipRegexList = r.checkSkipRegex
+            ? r.checkSkipRegex.split('\n').map(line => line.trim()).filter(Boolean).map(pattern => safeRegex(pattern)).filter(Boolean)
+            : [];
+        const shouldSkip = url => skipRegexList.some(regex => regex.test(url));
+        const toCheck = skipRegexList.length > 0 ? target.filter(rec => !shouldSkip(rec.url)) : target;
+        const skippedCount = target.length - toCheck.length;
+
+        // 对于被跳过的记录，直接标记为"跳过校验"
+        if (skippedCount > 0 && typeof onRowResult === 'function') {
+            target.forEach(rec => {
+                if (shouldSkip(rec.url)) {
+                    onRowResult(rec.url, { ok: null, reason: '跳过校验', title: '' });
+                }
+            });
+        }
+
         const resultMap = new Map();
         let done = 0;
         let cancelled = false;
@@ -608,15 +634,15 @@
             if (typeof onRowResult === 'function' && res) {
                 onRowResult(rec.url, res);
             }
-            if (typeof onProgress === 'function') onProgress(done, target.length);
+            if (typeof onProgress === 'function') onProgress(done, toCheck.length);
             return res;
         };
 
         if (runMode === 'sequential') {
-            for (let i = 0; i < target.length; i++) {
+            for (let i = 0; i < toCheck.length; i++) {
                 if (cancelled) break;
-                const res = await checkOne(target[i]);
-                if (res) resultMap.set(target[i].url, res);
+                const res = await checkOne(toCheck[i]);
+                if (res) resultMap.set(toCheck[i].url, res);
             }
         } else {
             let cursor = 0;
@@ -624,16 +650,16 @@
                 while (!cancelled) {
                     const i = cursor;
                     cursor++;
-                    if (i >= target.length) break;
-                    const res = await checkOne(target[i]);
-                    if (res) resultMap.set(target[i].url, res);
+                    if (i >= toCheck.length) break;
+                    const res = await checkOne(toCheck[i]);
+                    if (res) resultMap.set(toCheck[i].url, res);
                 }
             };
             const workers = Array.from({ length: Math.max(1, r.checkConcurrency) }, () => worker());
             await Promise.all(workers);
         }
 
-        return { resultMap, checkedCount: done, isCancelled: cancelled };
+        return { resultMap, checkedCount: done, skippedCount, isCancelled: cancelled };
     }
 
     function applyCheckResultToRecords(records, resultMap, useResponseTitle = false) {
@@ -642,6 +668,10 @@
             if (!hit) return { ...rec, checkOk: null, checkStatus: '未校验', checkReason: '超过校验上限或未执行' };
             // 如果配置了从响应提取标题，且校验返回了标题，则更新标题
             const newTitle = useResponseTitle && hit.title ? hit.title : rec.title;
+            // 处理跳过校验的情况
+            if (hit.reason === '跳过校验') {
+                return { ...rec, title: newTitle, checkOk: null, checkStatus: '跳过', checkReason: '跳过校验' };
+            }
             return { ...rec, title: newTitle, checkOk: hit.ok, checkStatus: hit.ok ? '可用' : '不可用', checkReason: hit.reason };
         });
     }
@@ -692,7 +722,7 @@
 
             // checkStatus 列根据状态设置颜色
             if (c.key === 'checkStatus') {
-                td.style.color = value === '可用' ? '#16a085' : (value === '不可用' ? '#dc2626' : '#999');
+                td.style.color = value === '可用' ? '#16a085' : (value === '不可用' ? '#dc2626' : (value === '跳过' ? '#f59e0b' : '#999'));
             }
 
             tr.appendChild(td);
@@ -711,7 +741,7 @@
         records[idx] = {
             ...records[idx],
             checkOk: checkResult.ok,
-            checkStatus: checkResult.ok ? '可用' : '不可用',
+            checkStatus: checkResult.reason === '跳过校验' ? '跳过' : (checkResult.ok ? '可用' : '不可用'),
             checkReason: checkResult.reason
         };
 
@@ -728,7 +758,7 @@
                     td.textContent = String(value ?? '');
                     // 根据状态设置颜色
                     if (c.key === 'checkStatus') {
-                        td.style.color = value === '可用' ? '#16a085' : (value === '不可用' ? '#dc2626' : '#999');
+                        td.style.color = value === '可用' ? '#16a085' : (value === '不可用' ? '#dc2626' : (value === '跳过' ? '#f59e0b' : '#999'));
                     }
                 }
             }
@@ -779,6 +809,7 @@
             checkedCount: checkedCount || 0,
             availableCount: availableCount || 0,
             unavailableCount: unavailableCount || 0,
+            skippedCount: 0,
             mode: rules.checkMode === 'sequential' ? 'sequential' : 'concurrent',
             checkTrigger: rules.checkTrigger === 'auto' ? 'auto' : 'manual',
             visibleColumns: normalizeColumnKeys(rules.visibleColumns, DEFAULT_VISIBLE_COLUMNS),
@@ -849,6 +880,7 @@
         const availabilityTimeoutMs = makeNum(cur.availabilityTimeoutMs);
         const maxCheckCount = makeNum(cur.maxCheckCount);
         const checkConcurrency = makeNum(cur.checkConcurrency);
+        const checkSkipRegex = makeTextarea(cur.checkSkipRegex, '每行一个正则，匹配 URL 则跳过校验\n如：^https?://\\d+\\.\\d+\\.\\d+\\.\\d+:\\d+');
         const unavailableKeywords = makeTextarea(cur.unavailableKeywords.join('\n'), '每行一个关键字');
 
         const dedupeByHost = Object.assign(document.createElement('input'), { type: 'checkbox', checked: cur.dedupeByHost });
@@ -874,6 +906,7 @@
             availabilityTimeoutMs.value = String(x.availabilityTimeoutMs);
             maxCheckCount.value = String(x.maxCheckCount);
             checkConcurrency.value = String(x.checkConcurrency);
+            checkSkipRegex.value = x.checkSkipRegex;
             unavailableKeywords.value = x.unavailableKeywords.join('\n');
             dedupeByHost.checked = x.dedupeByHost;
             autoPaginate.checked = x.autoPaginate;
@@ -893,7 +926,8 @@
         const summary = document.createElement('div');
         Object.assign(summary.style, STYLES.summary);
         const renderSummary = () => {
-            summary.textContent = `采集: ${allCount} | 过滤后: ${filteredCount} | 最终: ${state.records.length} | 页数: ${pagesCollected} | 校验: ${state.checkedCount}/${filteredCount} | 可用: ${state.availableCount} | 不可用: ${state.unavailableCount}`;
+            const skipped = state.records.filter(x => x.checkStatus === '跳过').length;
+            summary.textContent = `采集: ${allCount} | 过滤后: ${filteredCount} | 最终: ${state.records.length} | 页数: ${pagesCollected} | 校验: ${state.checkedCount}/${filteredCount} | 可用: ${state.availableCount} | 不可用: ${state.unavailableCount}${skipped > 0 ? ` | 跳过: ${skipped}` : ''}`;
         };
 
         // 内联配置区（默认折叠）
@@ -908,24 +942,32 @@
             padding: '10px 16px', cursor: 'pointer', fontSize: '13px', color: '#334155', userSelect: 'none'
         });
 
+        // 按钮行（固定在配置区顶部）
+        const topActionRow = document.createElement('div');
+        Object.assign(topActionRow.style, {
+            display: 'flex', justifyContent: 'flex-end', gap: '8px',
+            padding: '10px 16px', background: '#fcfcfc',
+            borderBottom: '1px solid #eef2f7'
+        });
+        const resetCfgBtn = makeBtn('恢复默认', '#a56a00', '#fff');
+        const topSaveCfgBtn = makeBtn('保存配置', '#16a085', '#fff');
+        const saveAndRerunBtn = makeBtn('保存并重新提取', '#2d7df6', '#fff');
+        topActionRow.append(resetCfgBtn, topSaveCfgBtn, saveAndRerunBtn);
+
+        // 配置内容区域（可滚动）
+        const configContent = document.createElement('div');
+        Object.assign(configContent.style, {
+            maxHeight: '38vh', overflowY: 'auto', overflowX: 'hidden'
+        });
+
         const configBody = document.createElement('div');
         Object.assign(configBody.style, {
-            padding: '10px 16px 14px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px',
-            borderTop: '1px solid #eef2f7',
-            maxHeight: '42vh',
-            overflowY: 'auto',
-            overflowX: 'hidden'
+            padding: '10px 16px 14px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px'
         });
         if (window.innerWidth < 900) {
             configBody.style.gridTemplateColumns = '1fr';
         }
-        const topActionRow = document.createElement('div');
-        Object.assign(topActionRow.style, {
-            gridColumn: '1 / span 2', display: 'flex', justifyContent: 'flex-end'
-        });
-        const topSaveCfgBtn = makeBtn('保存配置', '#16a085', '#fff');
-        topActionRow.append(topSaveCfgBtn);
-        configBody.appendChild(topActionRow);
+        configContent.appendChild(configBody);
 
         configBody.append(
             makeField('包含正则（匹配 标题+URL）', includeRegex),
@@ -940,6 +982,10 @@
             makeField('最多校验条数（0=全部）', maxCheckCount),
             makeField('并发校验数', checkConcurrency)
         );
+
+        const skipRegexField = makeField('跳过校验正则（每行一个，匹配 URL 则跳过）', checkSkipRegex);
+        skipRegexField.style.gridColumn = '1 / span 2';
+        configBody.appendChild(skipRegexField);
 
         const kwField = makeField('不可用关键字（每行一个）', unavailableKeywords);
         kwField.style.gridColumn = '1 / span 2';
@@ -982,17 +1028,11 @@
         modeRow.append(modeLabel, checkModeWrap);
         configBody.appendChild(modeRow);
 
-        const configActionRow = document.createElement('div');
-        Object.assign(configActionRow.style, {
-            gridColumn: '1 / span 2', display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '2px'
-        });
-        const resetCfgBtn = makeBtn('恢复默认', '#a56a00', '#fff');
-        const saveCfgBtn = makeBtn('保存配置', '#16a085', '#fff');
-        const saveAndRerunBtn = makeBtn('保存并重新提取', '#2d7df6', '#fff');
-        configActionRow.append(resetCfgBtn, saveCfgBtn, saveAndRerunBtn);
-        configBody.appendChild(configActionRow);
+        configDetails.append(configSummary, topActionRow, configContent);
 
-        configDetails.append(configSummary, configBody);
+        // 配置展开/折叠时，控制表格区域的显示（两者互斥）
+        const tableWrap = document.createElement('div');
+        Object.assign(tableWrap.style, STYLES.tableWrap);
 
         // 进度条容器
         const progressWrap = document.createElement('div');
@@ -1014,17 +1054,6 @@
         });
         progressBarOuter.appendChild(progressBarInner);
         progressWrap.append(progressBarOuter, progressText);
-
-        const showProgress = (done, total, show) => {
-            if (show) {
-                progressWrap.style.display = 'block';
-                const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-                progressBarInner.style.width = pct + '%';
-                progressText.textContent = `校验进度: ${done}/${total} (${pct}%)`;
-            } else {
-                progressWrap.style.display = 'none';
-            }
-        };
 
         // Toolbar
         const toolbar = document.createElement('div');
@@ -1048,6 +1077,31 @@
         actionWrap.append(colBtn, checkBtn);
         toolbar.appendChild(actionWrap);
 
+        // 配置展开/折叠时，控制表格区域和工具栏的显示（配置与表格互斥）
+        configDetails.addEventListener('toggle', () => {
+            if (configDetails.open) {
+                // 展开配置时隐藏表格、工具栏、进度条
+                tableWrap.style.display = 'none';
+                toolbar.style.display = 'none';
+                progressWrap.style.display = 'none';
+            } else {
+                // 折叠配置时显示表格、工具栏
+                tableWrap.style.display = 'block';
+                toolbar.style.display = 'flex';
+            }
+        });
+
+        const showProgress = (done, total, show) => {
+            if (show) {
+                progressWrap.style.display = 'block';
+                const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+                progressBarInner.style.width = pct + '%';
+                progressText.textContent = `校验进度: ${done}/${total} (${pct}%)`;
+            } else {
+                progressWrap.style.display = 'none';
+            }
+        };
+
         const saveInlineConfig = (notifyOnSuccess = true) => {
             const prevRules = getRules();
             const next = normalizeRules({
@@ -1067,6 +1121,7 @@
                 availabilityTimeoutMs: availabilityTimeoutMs.value,
                 maxCheckCount: maxCheckCount.value,
                 checkConcurrency: checkConcurrency.value,
+                checkSkipRegex: checkSkipRegex.value.split(/\r?\n/).map(x => x.trim()).filter(Boolean).join('\n'),
                 unavailableKeywords: unavailableKeywords.value.split(/[,\r?\n]/).map(x => x.trim()).filter(Boolean),
                 visibleColumns: state.visibleColumns,
                 copyColumns: state.copyColumns
@@ -1079,6 +1134,16 @@
             if (next.excludeRegex && !safeRegex(next.excludeRegex)) {
                 console.warn('[Quake URL 提取] 排除正则无效，未保存');
                 return false;
+            }
+            // 验证跳过校验正则的每一行
+            if (next.checkSkipRegex) {
+                const skipRegexLines = next.checkSkipRegex.split('\n');
+                for (const line of skipRegexLines) {
+                    if (line && !safeRegex(line)) {
+                        console.warn('[Quake URL 提取] 跳过校验正则无效，未保存：' + line);
+                        return false;
+                    }
+                }
             }
 
             const changed = JSON.stringify(prevRules) !== JSON.stringify(next);
@@ -1107,13 +1172,16 @@
             state.checkTrigger = rules.checkTrigger;
             state.mode = rules.checkMode;
             refreshCheckBtnLabel();
+            // 恢复默认后折叠配置区
+            configDetails.open = false;
         });
 
-        saveCfgBtn.addEventListener('click', () => {
-            saveInlineConfig(true);
-        });
         topSaveCfgBtn.addEventListener('click', () => {
-            saveInlineConfig(true);
+            const ok = saveInlineConfig(true);
+            if (ok) {
+                // 保存成功后折叠配置区
+                configDetails.open = false;
+            }
         });
 
         saveAndRerunBtn.addEventListener('click', async () => {
@@ -1124,12 +1192,9 @@
         });
 
         // Table
-        const wrap = document.createElement('div');
-        Object.assign(wrap.style, STYLES.tableWrap);
-
         const table = document.createElement('table');
         Object.assign(table.style, STYLES.table);
-        wrap.appendChild(table);
+        tableWrap.appendChild(table);
 
         // 初始化表格
         initTable(table, state.visibleColumns);
@@ -1138,27 +1203,6 @@
         // Footer
         const footer = document.createElement('div');
         Object.assign(footer.style, STYLES.footer);
-
-        const copyBtn = makeBtn('复制为 TSV', '#16a085', '#fff');
-        copyBtn.addEventListener('click', async () => {
-            try {
-                await copyToClipboard(toTsv(state.records, state.copyColumns));
-            } catch {
-                console.warn('[Quake URL 提取] 复制失败');
-            }
-        });
-
-        const csvBtn = makeBtn('下载 CSV', '#2d7df6', '#fff');
-        csvBtn.addEventListener('click', () => {
-            const ts = new Date().toISOString().replace(/[:.]/g, '-');
-            downloadAsTextFile(toCsv(state.records, state.copyColumns), `quake-urls-${ts}.csv`, 'text/csv;charset=utf-8');
-        });
-
-        const txtBtn = makeBtn('下载 URL 列表', '#5b6b7b', '#fff');
-        txtBtn.addEventListener('click', () => {
-            const ts = new Date().toISOString().replace(/[:.]/g, '-');
-            downloadAsTextFile(state.records.map(x => x.url).join('\n'), `quake-urls-${ts}.txt`);
-        });
 
         const closeBtn = makeBtn('关闭', '#999', '#fff');
         closeBtn.addEventListener('click', () => mask.remove());
@@ -1188,7 +1232,7 @@
             });
         });
 
-        footer.append(copyBtn, csvBtn, txtBtn, openAllBtn, openAvailableBtn, closeBtn);
+        footer.append(openAllBtn, openAvailableBtn, closeBtn);
 
         // 列设置
         colBtn.addEventListener('click', () => {
@@ -1290,7 +1334,7 @@
             showProgress(0, total, true);
 
             try {
-                const { resultMap, checkedCount: c, isCancelled } = await checkBatch(
+                const { resultMap, checkedCount: c, skippedCount: skipped, isCancelled } = await checkBatch(
                     state.records,
                     runtimeRules,
                     runtimeRules.checkMode,
@@ -1304,6 +1348,7 @@
                 );
 
                 state.checkedCount = isCancelled ? state.checkedCount : c;
+                state.skippedCount = skipped || 0;
                 state.records = applyCheckResultToRecords(state.records, resultMap, true);
                 state.availableCount = state.records.filter(x => x.checkStatus === '可用').length;
                 state.unavailableCount = state.records.filter(x => x.checkStatus === '不可用').length;
@@ -1335,7 +1380,7 @@
         }
 
         renderSummary();
-        panel.append(header, summary, configDetails, progressWrap, toolbar, wrap, footer);
+        panel.append(header, summary, configDetails, progressWrap, toolbar, tableWrap, footer);
         document.body.appendChild(mask);
     }
     // ============== 配置已并入结果弹窗 ============== 
