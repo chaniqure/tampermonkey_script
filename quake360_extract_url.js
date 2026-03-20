@@ -453,7 +453,6 @@
             if (r.targetCount > 0 && all.length >= r.targetCount) break;
             if (!r.autoPaginate || page >= maxPages) break;
 
-            GM_notification({ text: `正在翻页采集：第 ${page} 页完成，准备下一页...`, title: 'Quake URL 提取' });
             const ok = await gotoNextPage(r);
             if (!ok) break;
         }
@@ -472,13 +471,33 @@
         return '';
     }
 
-    function gmRequestAvailable(url, timeoutMs, fetchTitle) {
+    function gmRequestAvailable(url, timeoutMs, fetchTitle, cancelToken = null) {
         return new Promise(resolve => {
-            if (typeof GM_xmlhttpRequest !== 'function') {
-                resolve({ supported: false, ok: false, reason: 'gm-unavailable', title: '' });
+            let settled = false;
+            const finish = payload => {
+                if (settled) return;
+                settled = true;
+                resolve(payload);
+            };
+
+            if (cancelToken?.cancelled) {
+                finish({ supported: true, ok: false, reason: 'cancelled', title: '' });
                 return;
             }
-            GM_xmlhttpRequest({
+
+            if (typeof GM_xmlhttpRequest !== 'function') {
+                finish({ supported: false, ok: false, reason: 'gm-unavailable', title: '' });
+                return;
+            }
+
+            let req = null;
+            const cancelHandler = () => {
+                try { req?.abort?.(); } catch {}
+                finish({ supported: true, ok: false, reason: 'cancelled', title: '' });
+            };
+            if (cancelToken) cancelToken.handlers.push(cancelHandler);
+
+            req = GM_xmlhttpRequest({
                 method: 'GET',
                 url,
                 timeout: timeoutMs,
@@ -489,36 +508,47 @@
                     if (fetchTitle && resp.responseText) {
                         title = extractTitleFromHtml(resp.responseText);
                     }
-                    resolve({
+                    finish({
                         supported: true,
                         ok: (status >= 200 && status < 400) || status === 0,
                         reason: `http:${status || 0}`,
                         title
                     });
                 },
-                ontimeout: () => resolve({ supported: true, ok: false, reason: 'timeout', title: '' }),
-                onabort: () => resolve({ supported: true, ok: false, reason: 'aborted', title: '' }),
-                onerror: err => resolve({ supported: true, ok: false, reason: `error:${err?.error ?? err?.message ?? 'network'}`, title: '' })
+                ontimeout: () => finish({ supported: true, ok: false, reason: 'timeout', title: '' }),
+                onabort: () => finish({ supported: true, ok: false, reason: cancelToken?.cancelled ? 'cancelled' : 'aborted', title: '' }),
+                onerror: err => finish({ supported: true, ok: false, reason: `error:${err?.error ?? err?.message ?? 'network'}`, title: '' })
             });
         });
     }
 
-    async function checkUrlAvailable(url, timeoutMs, unavailableKeywords, fetchTitle = false) {
-        const gmRes = await gmRequestAvailable(url, timeoutMs, fetchTitle);
+    async function checkUrlAvailable(url, timeoutMs, unavailableKeywords, fetchTitle = false, cancelToken = null) {
+        if (cancelToken?.cancelled) return { url, ok: false, reason: 'cancelled', title: '' };
+
+        const gmRes = await gmRequestAvailable(url, timeoutMs, fetchTitle, cancelToken);
         if (gmRes.supported) return { url, ok: gmRes.ok, reason: gmRes.reason, title: gmRes.title };
 
         if (location.protocol === 'https:' && url.toLowerCase().startsWith('http://')) {
             return { url, ok: false, reason: 'blocked:mixed-content(http-on-https)', title: '' };
         }
 
+        if (cancelToken?.cancelled) return { url, ok: false, reason: 'cancelled', title: '' };
+
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+        if (cancelToken) {
+            cancelToken.handlers.push(() => {
+                try { ctrl.abort(); } catch {}
+            });
+        }
         try {
             await fetch(url, { method: 'GET', mode: 'no-cors', signal: ctrl.signal, cache: 'no-store' });
             clearTimeout(timer);
+            if (cancelToken?.cancelled) return { url, ok: false, reason: 'cancelled', title: '' };
             return { url, ok: true, reason: 'reachable(no-cors)', title: '' };
         } catch (e) {
             clearTimeout(timer);
+            if (cancelToken?.cancelled) return { url, ok: false, reason: 'cancelled', title: '' };
 
             // 尝试 favicon 检测
             const okByFavicon = await new Promise(resolve => {
@@ -533,6 +563,7 @@
                 }
             });
 
+            if (cancelToken?.cancelled) return { url, ok: false, reason: 'cancelled', title: '' };
             if (okByFavicon) return { url, ok: true, reason: 'reachable(favicon)', title: '' };
 
             const msg = String(e?.message ?? '').toLowerCase()
@@ -554,11 +585,24 @@
         const resultMap = new Map();
         let done = 0;
         let cancelled = false;
+        const runMode = mode === 'sequential' ? 'sequential' : 'concurrent';
+        const cancelToken = { cancelled: false, handlers: [] };
+
+        const triggerCancel = () => {
+            if (cancelled) return;
+            cancelled = true;
+            cancelToken.cancelled = true;
+            cancelToken.handlers.forEach(fn => {
+                try { fn(); } catch {}
+            });
+        };
+        if (typeof onCancel === 'function') onCancel(triggerCancel);
 
         const checkOne = async rec => {
             if (cancelled) return null;
-            const res = await checkUrlAvailable(rec.url, r.availabilityTimeoutMs, r.unavailableKeywords, fetchTitle);
+            const res = await checkUrlAvailable(rec.url, r.availabilityTimeoutMs, r.unavailableKeywords, fetchTitle, cancelToken);
             if (cancelled) return null;
+            if (res?.reason === 'cancelled') return null;
             done++;
             // 立即触发行更新回调
             if (typeof onRowResult === 'function' && res) {
@@ -568,7 +612,7 @@
             return res;
         };
 
-        if (mode === 'sequential') {
+        if (runMode === 'sequential') {
             for (let i = 0; i < target.length; i++) {
                 if (cancelled) break;
                 const res = await checkOne(target[i]);
@@ -585,13 +629,11 @@
                     if (res) resultMap.set(target[i].url, res);
                 }
             };
-            const workers = Array.from({ length: r.checkConcurrency }, () => worker());
+            const workers = Array.from({ length: Math.max(1, r.checkConcurrency) }, () => worker());
             await Promise.all(workers);
         }
 
-        if (typeof onCancel === 'function') onCancel(() => { cancelled = true; });
-
-        return { resultMap, checkedCount: target.length, isCancelled: cancelled };
+        return { resultMap, checkedCount: done, isCancelled: cancelled };
     }
 
     function applyCheckResultToRecords(records, resultMap, useResponseTitle = false) {
@@ -729,7 +771,6 @@
         fragment.appendChild(tbody);
         table.appendChild(fragment);
     }
-
     // ============== 结果弹窗 ==============
     function showResultModal({ allCount, filteredCount, finalRecords, checkedCount, availableCount, unavailableCount, pagesCollected, autoCheckDone = false }) {
         const { mask, panel } = createModal('quake-url-result-mask');
@@ -743,9 +784,105 @@
             visibleColumns: normalizeColumnKeys(rules.visibleColumns, DEFAULT_VISIBLE_COLUMNS),
             copyColumns: normalizeColumnKeys(rules.copyColumns, DEFAULT_COPY_COLUMNS),
             checking: false,
+            autoCheckingPending: rules.checkTrigger === 'auto' && !autoCheckDone && finalRecords.length > 0,
             cancelFn: null
         };
         const columns = getColumnsByKeys(state.visibleColumns);
+
+        const makeField = (label, node) => {
+            const box = document.createElement('label');
+            Object.assign(box.style, { display: 'flex', flexDirection: 'column', gap: '6px' });
+            const title = document.createElement('span');
+            title.textContent = label;
+            Object.assign(title.style, { fontSize: '13px', color: '#333' });
+            box.append(title, node);
+            return box;
+        };
+
+        const makeInput = (value, placeholder = '') => {
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.value = value;
+            input.placeholder = placeholder;
+            Object.assign(input.style, {
+                width: '100%', boxSizing: 'border-box', border: '1px solid #d9d9d9',
+                borderRadius: '6px', padding: '8px 10px', fontSize: '13px'
+            });
+            return input;
+        };
+
+        const makeNum = value => {
+            const input = makeInput(String(value));
+            input.inputMode = 'numeric';
+            return input;
+        };
+
+        const makeTextarea = (value, placeholder = '') => {
+            const ta = document.createElement('textarea');
+            ta.value = value;
+            ta.placeholder = placeholder;
+            Object.assign(ta.style, {
+                width: '100%', minHeight: '90px', boxSizing: 'border-box',
+                border: '1px solid #d9d9d9', borderRadius: '6px', padding: '8px 10px',
+                fontSize: '13px', resize: 'vertical'
+            });
+            return ta;
+        };
+
+        const makeCheckLine = (node, text) => {
+            const label = document.createElement('label');
+            Object.assign(label.style, { display: 'inline-flex', gap: '8px', alignItems: 'center' });
+            label.append(node, document.createTextNode(text));
+            return label;
+        };
+
+        const cur = getRules();
+
+        const includeRegex = makeInput(cur.includeRegex, '例如：edu|gov');
+        const excludeRegex = makeInput(cur.excludeRegex, '例如：login|signup');
+        const allowProtocols = makeInput(cur.allowProtocols.join(','), 'http:,https:');
+        const resultLinkSelector = makeInput(cur.resultLinkSelector, '结果链接选择器');
+        const nextPageSelector = makeInput(cur.nextPageSelector, '下一页按钮选择器');
+        const maxPages = makeNum(cur.maxPages);
+        const targetCount = makeNum(cur.targetCount);
+        const pageWaitMs = makeNum(cur.pageWaitMs);
+        const availabilityTimeoutMs = makeNum(cur.availabilityTimeoutMs);
+        const maxCheckCount = makeNum(cur.maxCheckCount);
+        const checkConcurrency = makeNum(cur.checkConcurrency);
+        const unavailableKeywords = makeTextarea(cur.unavailableKeywords.join('\n'), '每行一个关键字');
+
+        const dedupeByHost = Object.assign(document.createElement('input'), { type: 'checkbox', checked: cur.dedupeByHost });
+        const autoPaginate = Object.assign(document.createElement('input'), { type: 'checkbox', checked: cur.autoPaginate });
+        const onlyKeepAvailable = Object.assign(document.createElement('input'), { type: 'checkbox', checked: cur.onlyKeepAvailable });
+
+        const autoRadio = Object.assign(document.createElement('input'), { type: 'radio', name: 'checkTrigger-inline', value: 'auto', checked: cur.checkTrigger === 'auto' });
+        const manualRadio = Object.assign(document.createElement('input'), { type: 'radio', name: 'checkTrigger-inline', value: 'manual', checked: cur.checkTrigger === 'manual' });
+
+        const seqRadio = Object.assign(document.createElement('input'), { type: 'radio', name: 'checkMode-inline', value: 'sequential', checked: cur.checkMode === 'sequential' });
+        const conRadio = Object.assign(document.createElement('input'), { type: 'radio', name: 'checkMode-inline', value: 'concurrent', checked: cur.checkMode === 'concurrent' });
+
+        const applyRulesToConfigInputs = sourceRules => {
+            const x = normalizeRules(sourceRules);
+            includeRegex.value = x.includeRegex;
+            excludeRegex.value = x.excludeRegex;
+            allowProtocols.value = x.allowProtocols.join(',');
+            resultLinkSelector.value = x.resultLinkSelector;
+            nextPageSelector.value = x.nextPageSelector;
+            maxPages.value = String(x.maxPages);
+            targetCount.value = String(x.targetCount);
+            pageWaitMs.value = String(x.pageWaitMs);
+            availabilityTimeoutMs.value = String(x.availabilityTimeoutMs);
+            maxCheckCount.value = String(x.maxCheckCount);
+            checkConcurrency.value = String(x.checkConcurrency);
+            unavailableKeywords.value = x.unavailableKeywords.join('\n');
+            dedupeByHost.checked = x.dedupeByHost;
+            autoPaginate.checked = x.autoPaginate;
+            onlyKeepAvailable.checked = x.onlyKeepAvailable;
+            autoRadio.checked = x.checkTrigger === 'auto';
+            manualRadio.checked = x.checkTrigger === 'manual';
+            seqRadio.checked = x.checkMode === 'sequential';
+            conRadio.checked = x.checkMode === 'concurrent';
+        };
 
         // Header
         const header = document.createElement('div');
@@ -758,6 +895,104 @@
         const renderSummary = () => {
             summary.textContent = `采集: ${allCount} | 过滤后: ${filteredCount} | 最终: ${state.records.length} | 页数: ${pagesCollected} | 校验: ${state.checkedCount}/${filteredCount} | 可用: ${state.availableCount} | 不可用: ${state.unavailableCount}`;
         };
+
+        // 内联配置区（默认折叠）
+        const configDetails = document.createElement('details');
+        Object.assign(configDetails.style, {
+            borderBottom: '1px solid #eee', background: '#fcfcfc'
+        });
+
+        const configSummary = document.createElement('summary');
+        configSummary.textContent = '采集配置（默认折叠，展开可修改）';
+        Object.assign(configSummary.style, {
+            padding: '10px 16px', cursor: 'pointer', fontSize: '13px', color: '#334155', userSelect: 'none'
+        });
+
+        const configBody = document.createElement('div');
+        Object.assign(configBody.style, {
+            padding: '10px 16px 14px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px',
+            borderTop: '1px solid #eef2f7',
+            maxHeight: '42vh',
+            overflowY: 'auto',
+            overflowX: 'hidden'
+        });
+        if (window.innerWidth < 900) {
+            configBody.style.gridTemplateColumns = '1fr';
+        }
+        const topActionRow = document.createElement('div');
+        Object.assign(topActionRow.style, {
+            gridColumn: '1 / span 2', display: 'flex', justifyContent: 'flex-end'
+        });
+        const topSaveCfgBtn = makeBtn('保存配置', '#16a085', '#fff');
+        topActionRow.append(topSaveCfgBtn);
+        configBody.appendChild(topActionRow);
+
+        configBody.append(
+            makeField('包含正则（匹配 标题+URL）', includeRegex),
+            makeField('排除正则（匹配 标题+URL）', excludeRegex),
+            makeField('允许协议（逗号分隔）', allowProtocols),
+            makeField('结果链接选择器', resultLinkSelector),
+            makeField('下一页按钮选择器', nextPageSelector),
+            makeField('最大采集页数（自动翻页时生效）', maxPages),
+            makeField('目标采集条数（0=不限）', targetCount),
+            makeField('翻页等待毫秒', pageWaitMs),
+            makeField('校验超时毫秒', availabilityTimeoutMs),
+            makeField('最多校验条数（0=全部）', maxCheckCount),
+            makeField('并发校验数', checkConcurrency)
+        );
+
+        const kwField = makeField('不可用关键字（每行一个）', unavailableKeywords);
+        kwField.style.gridColumn = '1 / span 2';
+        configBody.appendChild(kwField);
+
+        const checkRow = document.createElement('div');
+        Object.assign(checkRow.style, { gridColumn: '1 / span 2', display: 'flex', gap: '16px', flexWrap: 'wrap', alignItems: 'center' });
+        checkRow.append(
+            makeCheckLine(dedupeByHost, '按 Host 去重'),
+            makeCheckLine(autoPaginate, '自动翻页采集'),
+            makeCheckLine(onlyKeepAvailable, '仅保留可用 URL')
+        );
+        configBody.appendChild(checkRow);
+
+        const triggerRow = document.createElement('div');
+        Object.assign(triggerRow.style, { gridColumn: '1 / span 2' });
+        const triggerLabel = document.createElement('div');
+        triggerLabel.textContent = '校验触发方式：';
+        Object.assign(triggerLabel.style, { fontSize: '13px', color: '#333', marginBottom: '6px' });
+        const checkTriggerWrap = document.createElement('div');
+        Object.assign(checkTriggerWrap.style, { display: 'flex', gap: '16px', flexWrap: 'wrap' });
+        checkTriggerWrap.append(
+            makeCheckLine(autoRadio, '自动校验'),
+            makeCheckLine(manualRadio, '手动校验')
+        );
+        triggerRow.append(triggerLabel, checkTriggerWrap);
+        configBody.appendChild(triggerRow);
+
+        const modeRow = document.createElement('div');
+        Object.assign(modeRow.style, { gridColumn: '1 / span 2' });
+        const modeLabel = document.createElement('div');
+        modeLabel.textContent = '校验模式：';
+        Object.assign(modeLabel.style, { fontSize: '13px', color: '#333', marginBottom: '6px' });
+        const checkModeWrap = document.createElement('div');
+        Object.assign(checkModeWrap.style, { display: 'flex', gap: '16px', flexWrap: 'wrap' });
+        checkModeWrap.append(
+            makeCheckLine(seqRadio, '顺序校验'),
+            makeCheckLine(conRadio, '并发校验')
+        );
+        modeRow.append(modeLabel, checkModeWrap);
+        configBody.appendChild(modeRow);
+
+        const configActionRow = document.createElement('div');
+        Object.assign(configActionRow.style, {
+            gridColumn: '1 / span 2', display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '2px'
+        });
+        const resetCfgBtn = makeBtn('恢复默认', '#a56a00', '#fff');
+        const saveCfgBtn = makeBtn('保存配置', '#16a085', '#fff');
+        const saveAndRerunBtn = makeBtn('保存并重新提取', '#2d7df6', '#fff');
+        configActionRow.append(resetCfgBtn, saveCfgBtn, saveAndRerunBtn);
+        configBody.appendChild(configActionRow);
+
+        configDetails.append(configSummary, configBody);
 
         // 进度条容器
         const progressWrap = document.createElement('div');
@@ -796,8 +1031,15 @@
         Object.assign(toolbar.style, STYLES.toolbar);
 
         const colBtn = makeBtn('列设置', '#0f766e', '#fff');
-        const checkBtn = makeBtn(state.checkTrigger === 'auto' ? '自动校验中...' : '开始校验', '#b45309', '#fff');
-        if (state.checkTrigger === 'auto' && !autoCheckDone) {
+        const checkBtn = makeBtn('', '#b45309', '#fff');
+        const refreshCheckBtnLabel = () => {
+            if (state.checking) {
+                return;
+            }
+            checkBtn.textContent = state.autoCheckingPending ? '自动校验中...' : '开始校验';
+        };
+        refreshCheckBtnLabel();
+        if (state.autoCheckingPending) {
             checkBtn.disabled = true;
         }
 
@@ -805,6 +1047,81 @@
         Object.assign(actionWrap.style, { display: 'inline-flex', gap: '8px' });
         actionWrap.append(colBtn, checkBtn);
         toolbar.appendChild(actionWrap);
+
+        const saveInlineConfig = (notifyOnSuccess = true) => {
+            const prevRules = getRules();
+            const next = normalizeRules({
+                includeRegex: includeRegex.value.trim(),
+                excludeRegex: excludeRegex.value.trim(),
+                allowProtocols: allowProtocols.value.split(',').map(x => x.trim()).filter(Boolean),
+                dedupeByHost: dedupeByHost.checked,
+                resultLinkSelector: resultLinkSelector.value.trim(),
+                autoPaginate: autoPaginate.checked,
+                nextPageSelector: nextPageSelector.value.trim(),
+                maxPages: maxPages.value,
+                targetCount: targetCount.value,
+                pageWaitMs: pageWaitMs.value,
+                checkTrigger: autoRadio.checked ? 'auto' : 'manual',
+                checkMode: seqRadio.checked ? 'sequential' : 'concurrent',
+                onlyKeepAvailable: onlyKeepAvailable.checked,
+                availabilityTimeoutMs: availabilityTimeoutMs.value,
+                maxCheckCount: maxCheckCount.value,
+                checkConcurrency: checkConcurrency.value,
+                unavailableKeywords: unavailableKeywords.value.split(/[,\r?\n]/).map(x => x.trim()).filter(Boolean),
+                visibleColumns: state.visibleColumns,
+                copyColumns: state.copyColumns
+            });
+
+            if (next.includeRegex && !safeRegex(next.includeRegex)) {
+                console.warn('[Quake URL 提取] 包含正则无效，未保存');
+                return false;
+            }
+            if (next.excludeRegex && !safeRegex(next.excludeRegex)) {
+                console.warn('[Quake URL 提取] 排除正则无效，未保存');
+                return false;
+            }
+
+            const changed = JSON.stringify(prevRules) !== JSON.stringify(next);
+            saveRules(next);
+            rules = next;
+            state.checkTrigger = next.checkTrigger;
+            state.mode = next.checkMode;
+            state.autoCheckingPending = false;
+            if (!state.checking) {
+                refreshCheckBtnLabel();
+                checkBtn.disabled = false;
+            }
+            if (notifyOnSuccess) {
+                GM_notification({
+                    text: changed ? '配置已保存' : '配置无变化',
+                    title: 'Quake URL 提取'
+                });
+            }
+            return true;
+        };
+
+        resetCfgBtn.addEventListener('click', () => {
+            applyRulesToConfigInputs(DEFAULT_RULES);
+            saveRules(DEFAULT_RULES);
+            rules = getRules();
+            state.checkTrigger = rules.checkTrigger;
+            state.mode = rules.checkMode;
+            refreshCheckBtnLabel();
+        });
+
+        saveCfgBtn.addEventListener('click', () => {
+            saveInlineConfig(true);
+        });
+        topSaveCfgBtn.addEventListener('click', () => {
+            saveInlineConfig(true);
+        });
+
+        saveAndRerunBtn.addEventListener('click', async () => {
+            const ok = saveInlineConfig();
+            if (!ok) return;
+            mask.remove();
+            await runExtractFlow();
+        });
 
         // Table
         const wrap = document.createElement('div');
@@ -826,9 +1143,8 @@
         copyBtn.addEventListener('click', async () => {
             try {
                 await copyToClipboard(toTsv(state.records, state.copyColumns));
-                GM_notification({ text: `已复制 ${state.records.length} 条数据，可直接粘贴到 Excel。`, title: 'Quake URL 提取' });
             } catch {
-                GM_notification({ text: '复制失败', title: 'Quake URL 提取' });
+                console.warn('[Quake URL 提取] 复制失败');
             }
         });
 
@@ -853,27 +1169,23 @@
                 .filter(r => r.checkStatus === '可用' && r.url)
                 .map(r => r.url);
             if (!availableUrls.length) {
-                GM_notification({ text: '没有可用的链接', title: 'Quake URL 提取' });
                 return;
             }
             // 逐个打开链接（使用延迟避免被浏览器阻止）
             availableUrls.forEach((url, i) => {
                 setTimeout(() => window.open(url, '_blank', 'noopener,noreferrer'), i * 100);
             });
-            GM_notification({ text: `已打开 ${availableUrls.length} 个可用链接`, title: 'Quake URL 提取' });
         });
 
         const openAllBtn = makeBtn('打开全部链接', '#2d7df6', '#fff');
         openAllBtn.addEventListener('click', () => {
             const allUrls = state.records.filter(r => r.url).map(r => r.url);
             if (!allUrls.length) {
-                GM_notification({ text: '没有链接', title: 'Quake URL 提取' });
                 return;
             }
             allUrls.forEach((url, i) => {
                 setTimeout(() => window.open(url, '_blank', 'noopener,noreferrer'), i * 100);
             });
-            GM_notification({ text: `已打开 ${allUrls.length} 个链接`, title: 'Quake URL 提取' });
         });
 
         footer.append(copyBtn, csvBtn, txtBtn, openAllBtn, openAvailableBtn, closeBtn);
@@ -927,7 +1239,6 @@
                 const selectedDisplay = displayGroup.checks.filter(x => x.cb.checked).map(x => x.key);
                 const selectedCopy = copyGroup.checks.filter(x => x.cb.checked).map(x => x.key);
                 if (!selectedDisplay.length || !selectedCopy.length) {
-                    GM_notification({ text: '显示列和复制列至少各选择一列', title: 'Quake URL 提取' });
                     return;
                 }
                 state.visibleColumns = normalizeColumnKeys(selectedDisplay, DEFAULT_VISIBLE_COLUMNS);
@@ -937,7 +1248,6 @@
                 runtimeRules.copyColumns = state.copyColumns;
                 saveRules(runtimeRules);
                 rules = runtimeRules;
-                // 重新渲染整个表格（因为列配置改变了）
                 renderRows(table, state);
                 cmask.remove();
             });
@@ -951,14 +1261,12 @@
         const onRowResult = (url, result) => {
             const idx = state.records.findIndex(r => r.url === url);
             if (idx !== -1) {
-                // 如果响应中有标题且更优，则更新标题
                 if (result.title && result.title.length > 2 && state.records[idx].title !== result.title) {
                     state.records[idx].title = result.title;
                 }
                 state.records[idx].checkOk = result.ok;
                 state.records[idx].checkStatus = result.ok ? '可用' : '不可用';
                 state.records[idx].checkReason = result.reason;
-                // 更新表格中的该行
                 updateRow(table, url, result, columns, state.records);
             }
         };
@@ -966,13 +1274,12 @@
         // 校验
         const runCheck = async () => {
             if (!state.records.length) {
-                GM_notification({ text: '当前没有可校验的数据', title: 'Quake URL 提取' });
                 return;
             }
 
             state.checking = true;
             colBtn.disabled = true;
-            checkBtn.disabled = true;
+            checkBtn.disabled = false;
 
             const runtimeRules = getRules();
             const total = runtimeRules.maxCheckCount > 0
@@ -993,7 +1300,7 @@
                     },
                     onRowResult,
                     cancel => { state.cancelFn = cancel; },
-                    true // fetchTitle: 从响应中提取标题
+                    true
                 );
 
                 state.checkedCount = isCancelled ? state.checkedCount : c;
@@ -1004,10 +1311,11 @@
                 renderSummary();
             } finally {
                 state.checking = false;
+                state.autoCheckingPending = false;
                 state.cancelFn = null;
                 colBtn.disabled = false;
                 checkBtn.disabled = false;
-                checkBtn.textContent = '开始校验';
+                refreshCheckBtnLabel();
                 showProgress(0, 0, false);
             }
         };
@@ -1022,219 +1330,22 @@
             await runCheck();
         });
 
-        // 如果是自动校验模式且尚未完成，则自动开始校验
-        if (state.checkTrigger === 'auto' && !autoCheckDone && state.records.length > 0) {
+        if (state.autoCheckingPending) {
             setTimeout(() => { runCheck(); }, 300);
         }
 
         renderSummary();
-        panel.append(header, summary, progressWrap, toolbar, wrap, footer);
+        panel.append(header, summary, configDetails, progressWrap, toolbar, wrap, footer);
         document.body.appendChild(mask);
     }
-
-    // ============== 配置面板 ==============
-    function showConfigModal() {
-        const cur = getRules();
-        const { mask, panel } = createModal('quake-url-config-mask', 'min(980px, 95vw)');
-
-        const header = document.createElement('div');
-        header.textContent = 'Quake URL 提取配置';
-        Object.assign(header.style, STYLES.header);
-
-        const body = document.createElement('div');
-        Object.assign(body.style, {
-            padding: '14px 16px', overflow: 'auto', maxHeight: '70vh',
-            display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px'
-        });
-
-        const makeField = (label, node) => {
-            const box = document.createElement('label');
-            Object.assign(box.style, { display: 'flex', flexDirection: 'column', gap: '6px' });
-            const title = document.createElement('span');
-            title.textContent = label;
-            Object.assign(title.style, { fontSize: '13px', color: '#333' });
-            box.append(title, node);
-            return box;
-        };
-
-        const makeInput = (value, placeholder = '') => {
-            const input = document.createElement('input');
-            input.type = 'text';
-            input.value = value;
-            input.placeholder = placeholder;
-            Object.assign(input.style, {
-                width: '100%', boxSizing: 'border-box', border: '1px solid #d9d9d9',
-                borderRadius: '6px', padding: '8px 10px', fontSize: '13px'
-            });
-            return input;
-        };
-
-        const makeNum = value => {
-            const input = makeInput(String(value));
-            input.inputMode = 'numeric';
-            return input;
-        };
-
-        const makeTextarea = (value, placeholder = '') => {
-            const ta = document.createElement('textarea');
-            ta.value = value;
-            ta.placeholder = placeholder;
-            Object.assign(ta.style, {
-                width: '100%', minHeight: '90px', boxSizing: 'border-box',
-                border: '1px solid #d9d9d9', borderRadius: '6px', padding: '8px 10px',
-                fontSize: '13px', resize: 'vertical'
-            });
-            return ta;
-        };
-
-        const makeCheckLine = (node, text) => {
-            const label = document.createElement('label');
-            Object.assign(label.style, { display: 'inline-flex', gap: '8px', alignItems: 'center' });
-            label.append(node, document.createTextNode(text));
-            return label;
-        };
-
-        // 字段
-        const includeRegex = makeInput(cur.includeRegex, '例如：edu|gov');
-        const excludeRegex = makeInput(cur.excludeRegex, '例如：login|signup');
-        const allowProtocols = makeInput(cur.allowProtocols.join(','), 'http:,https:');
-        const resultLinkSelector = makeInput(cur.resultLinkSelector, '结果链接选择器');
-        const nextPageSelector = makeInput(cur.nextPageSelector, '下一页按钮选择器');
-        const maxPages = makeNum(cur.maxPages);
-        const targetCount = makeNum(cur.targetCount);
-        const pageWaitMs = makeNum(cur.pageWaitMs);
-        const availabilityTimeoutMs = makeNum(cur.availabilityTimeoutMs);
-        const maxCheckCount = makeNum(cur.maxCheckCount);
-        const checkConcurrency = makeNum(cur.checkConcurrency);
-        const unavailableKeywords = makeTextarea(cur.unavailableKeywords.join('\n'), '每行一个关键字');
-
-        const dedupeByHost = Object.assign(document.createElement('input'), { type: 'checkbox', checked: cur.dedupeByHost });
-        const autoPaginate = Object.assign(document.createElement('input'), { type: 'checkbox', checked: cur.autoPaginate });
-        const onlyKeepAvailable = Object.assign(document.createElement('input'), { type: 'checkbox', checked: cur.onlyKeepAvailable });
-
-        // 校验触发方式：radio
-        const checkTriggerWrap = document.createElement('div');
-        Object.assign(checkTriggerWrap.style, { display: 'flex', gap: '16px', flexWrap: 'wrap' });
-        const autoRadio = Object.assign(document.createElement('input'), { type: 'radio', name: 'checkTrigger', value: 'auto', checked: cur.checkTrigger === 'auto' });
-        const manualRadio = Object.assign(document.createElement('input'), { type: 'radio', name: 'checkTrigger', value: 'manual', checked: cur.checkTrigger === 'manual' });
-        checkTriggerWrap.append(
-            makeCheckLine(autoRadio, '自动校验'),
-            makeCheckLine(manualRadio, '手动校验')
-        );
-
-        // 校验模式：radio
-        const checkModeWrap = document.createElement('div');
-        Object.assign(checkModeWrap.style, { display: 'flex', gap: '16px', flexWrap: 'wrap' });
-        const seqRadio = Object.assign(document.createElement('input'), { type: 'radio', name: 'checkMode', value: 'sequential', checked: cur.checkMode === 'sequential' });
-        const conRadio = Object.assign(document.createElement('input'), { type: 'radio', name: 'checkMode', value: 'concurrent', checked: cur.checkMode === 'concurrent' });
-        checkModeWrap.append(
-            makeCheckLine(seqRadio, '顺序校验'),
-            makeCheckLine(conRadio, '并发校验')
-        );
-
-        body.append(
-            makeField('包含正则（匹配 标题+URL）', includeRegex),
-            makeField('排除正则（匹配 标题+URL）', excludeRegex),
-            makeField('允许协议（逗号分隔）', allowProtocols),
-            makeField('结果链接选择器', resultLinkSelector),
-            makeField('下一页按钮选择器', nextPageSelector),
-            makeField('最大采集页数（自动翻页时生效）', maxPages),
-            makeField('目标采集条数（0=不限）', targetCount),
-            makeField('翻页等待毫秒', pageWaitMs),
-            makeField('校验超时毫秒', availabilityTimeoutMs),
-            makeField('最多校验条数（0=全部）', maxCheckCount),
-            makeField('并发校验数', checkConcurrency)
-        );
-
-        const kwField = makeField('不可用关键字（每行一个）', unavailableKeywords);
-        kwField.style.gridColumn = '1 / span 2';
-        body.appendChild(kwField);
-
-        const checkRow = document.createElement('div');
-        Object.assign(checkRow.style, { gridColumn: '1 / span 2', display: 'flex', gap: '16px', flexWrap: 'wrap', alignItems: 'center' });
-        checkRow.append(
-            makeCheckLine(dedupeByHost, '按 Host 去重'),
-            makeCheckLine(autoPaginate, '自动翻页采集'),
-            makeCheckLine(onlyKeepAvailable, '仅保留可用 URL')
-        );
-        body.appendChild(checkRow);
-
-        // 校验触发方式单独一行
-        const triggerRow = document.createElement('div');
-        Object.assign(triggerRow.style, { gridColumn: '1 / span 2' });
-        const triggerLabel = document.createElement('div');
-        triggerLabel.textContent = '校验触发方式：';
-        Object.assign(triggerLabel.style, { fontSize: '13px', color: '#333', marginBottom: '6px' });
-        triggerRow.append(triggerLabel, checkTriggerWrap);
-        body.appendChild(triggerRow);
-
-        // 校验模式单独一行
-        const modeRow = document.createElement('div');
-        Object.assign(modeRow.style, { gridColumn: '1 / span 2' });
-        const modeLabel = document.createElement('div');
-        modeLabel.textContent = '校验模式：';
-        Object.assign(modeLabel.style, { fontSize: '13px', color: '#333', marginBottom: '6px' });
-        modeRow.append(modeLabel, checkModeWrap);
-        body.appendChild(modeRow);
-
-        const footer = document.createElement('div');
-        Object.assign(footer.style, STYLES.footer);
-
-        const resetBtn = makeBtn('恢复默认', '#a56a00', '#fff');
-        resetBtn.addEventListener('click', () => {
-            saveRules(DEFAULT_RULES);
-            rules = getRules();
-            mask.remove();
-            GM_notification({ text: '已恢复默认配置', title: 'Quake URL 提取' });
-        });
-
-        const saveBtn = makeBtn('保存配置', '#16a085', '#fff');
-        saveBtn.addEventListener('click', () => {
-            const next = normalizeRules({
-                includeRegex: includeRegex.value.trim(),
-                excludeRegex: excludeRegex.value.trim(),
-                allowProtocols: allowProtocols.value.split(',').map(x => x.trim()).filter(Boolean),
-                dedupeByHost: dedupeByHost.checked,
-                resultLinkSelector: resultLinkSelector.value.trim(),
-                autoPaginate: autoPaginate.checked,
-                nextPageSelector: nextPageSelector.value.trim(),
-                maxPages: maxPages.value,
-                targetCount: targetCount.value,
-                pageWaitMs: pageWaitMs.value,
-                checkTrigger: autoRadio.checked ? 'auto' : 'manual',
-                checkMode: seqRadio.checked ? 'sequential' : 'concurrent',
-                onlyKeepAvailable: onlyKeepAvailable.checked,
-                availabilityTimeoutMs: availabilityTimeoutMs.value,
-                maxCheckCount: maxCheckCount.value,
-                checkConcurrency: checkConcurrency.value,
-                unavailableKeywords: unavailableKeywords.value.split(/[,\r?\n]/).map(x => x.trim()).filter(Boolean)
-            });
-
-            if (next.includeRegex && !safeRegex(next.includeRegex)) return;
-            if (next.excludeRegex && !safeRegex(next.excludeRegex)) return;
-
-            saveRules(next);
-            rules = next;
-            GM_notification({ text: '配置已保存', title: 'Quake URL 提取' });
-            mask.remove();
-        });
-
-        const closeBtn = makeBtn('关闭', '#999', '#fff');
-        closeBtn.addEventListener('click', () => mask.remove());
-
-        footer.append(resetBtn, saveBtn, closeBtn);
-        panel.append(header, body, footer);
-        document.body.appendChild(mask);
-    }
+    // ============== 配置已并入结果弹窗 ============== 
 
     // ============== 导入导出 ==============
     function exportRules() {
         const text = JSON.stringify(getRules(), null, 2);
         copyToClipboard(text).then(() => {
-            GM_notification({ text: '规则 JSON 已复制到剪贴板', title: 'Quake URL 提取' });
         }).catch(() => {
             console.log(text);
-            GM_notification({ text: '复制失败，已输出到控制台', title: 'Quake URL 提取' });
         });
     }
 
@@ -1245,9 +1356,8 @@
             const next = normalizeRules(JSON.parse(raw));
             saveRules(next);
             rules = next;
-            GM_notification({ text: '导入成功', title: 'Quake URL 提取' });
         } catch (e) {
-            GM_notification({ text: `JSON 格式错误：${e.message}`, title: 'Quake URL 提取' });
+            console.error(`[Quake URL 提取] JSON 格式错误：${e.message}`);
         }
     }
 
@@ -1299,23 +1409,14 @@
         });
         runBtn.addEventListener('click', runExtractFlow);
 
-        const cfgBtn = document.createElement('button');
-        cfgBtn.textContent = '配置';
-        Object.assign(cfgBtn.style, {
-            padding: '8px 14px', borderRadius: '8px', border: '1px solid #2d7df6',
-            background: '#fff', color: '#2d7df6', cursor: 'pointer', fontSize: '13px'
-        });
-        cfgBtn.addEventListener('click', showConfigModal);
-
-        wrap.append(runBtn, cfgBtn);
+        wrap.append(runBtn);
         document.body.appendChild(wrap);
     }
 
     function initMenu() {
-        GM_registerMenuCommand('打开配置面板', showConfigModal);
-        GM_registerMenuCommand('导出规则(JSON)', exportRules);
-        GM_registerMenuCommand('导入规则(JSON)', importRules);
-        GM_registerMenuCommand('立即提取 URL', runExtractFlow);
+        GM_registerMenuCommand('打开面板', runExtractFlow);
+        GM_registerMenuCommand('导出规则', exportRules);
+        GM_registerMenuCommand('导入规则', importRules);
     }
 
     // 全局错误处理
@@ -1333,3 +1434,4 @@
 
     init();
 })();
+
