@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微步关联资产提取器
 // @namespace    local.codex.threatbook
-// @version      1.1.0
+// @version      1.1.2
 // @description  提取微步 IP/域名情报页面中的关联域名和 IP，并导出 CSV/JSON。
 // @author       Codex
 // @match        https://x.threatbook.com/v5/ip/*
@@ -335,6 +335,94 @@
     }
   }
 
+  function findRelevantTable(classification) {
+    return relevantTables().find((table) => classifyTable(tableHeaders(table), table) === classification);
+  }
+
+  function extractStaticTable(table, sourceOverride = '') {
+    if (!table) return;
+    const headers = tableHeaders(table);
+    const source = sourceOverride || classifyTable(headers, table);
+    setStatus(`正在提取 ${sourceLabel(source)}…`, 'working');
+    for (const row of dataRows(table)) extractRow(row, headers, source);
+  }
+
+  function hasIsolatedPagination(table) {
+    let current = table;
+    for (let depth = 0; depth < 12 && current; depth += 1, current = current.parentElement) {
+      if (current.querySelector?.('.x-antd-comp-pagination') && current.querySelectorAll('table').length === 1) return true;
+    }
+    return false;
+  }
+
+  async function waitForOptional(predicate, timeout = 1500, interval = 50) {
+    const started = Date.now();
+    while (Date.now() - started < timeout) {
+      if (state.cancelled) throw new Error('用户已停止提取');
+      const value = predicate();
+      if (value) return value;
+      await sleep(interval);
+    }
+    return null;
+  }
+
+  function dispatchPointerClick(element) {
+    const common = { bubbles: true, cancelable: true, composed: true, view: window, button: 0 };
+    const events = [
+      new PointerEvent('pointerdown', { ...common, buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true }),
+      new MouseEvent('mousedown', { ...common, buttons: 1 }),
+      new PointerEvent('pointerup', { ...common, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true }),
+      new MouseEvent('mouseup', { ...common, buttons: 0 }),
+      new MouseEvent('click', { ...common, buttons: 0 }),
+    ];
+    for (const event of events) element.dispatchEvent(event);
+  }
+
+  async function activateDomainHistoryToggle(toggle, expectedText) {
+    const target = toggle.querySelector('span') || toggle;
+    target.click();
+    const changed = () => normalizeText(toggle.textContent) === expectedText;
+    if (await waitForOptional(changed)) return true;
+    dispatchPointerClick(target);
+    return Boolean(await waitForOptional(changed));
+  }
+
+  async function expandDomainIpHistory() {
+    const container = document.querySelector('.history-resolve');
+    const toggle = container?.querySelector(':scope > .show-more');
+    if (!toggle || normalizeText(toggle.textContent) !== '查看更多') return null;
+
+    const historyTable = findRelevantTable('domain_ip_history');
+    if (!historyTable) return null;
+    if (!await activateDomainHistoryToggle(toggle, '收起')) {
+      state.errors.push('无法自动展开历史解析 IP，已继续提取页面当前可见数据');
+      return null;
+    }
+    return true;
+  }
+
+  async function crawlDomainResolution() {
+    await switchTab('domain');
+
+    // 域名页的“最近解析 IP”和“历史解析 IP”没有自己的分页器。
+    // 不能使用通用的向上查找分页逻辑，否则会误绑定下方“历史解析记录”的分页器。
+    extractStaticTable(findRelevantTable('domain_current_resolution'));
+
+    const historyExpanded = await expandDomainIpHistory();
+    try {
+      const ipHistory = findRelevantTable('domain_ip_history');
+      if (ipHistory && hasIsolatedPagination(ipHistory)) await crawlTable(ipHistory);
+      else extractStaticTable(ipHistory);
+      const timeline = findRelevantTable('domain_history_timeline');
+      if (timeline) await crawlTable(timeline);
+    } finally {
+      const toggle = document.querySelector('.history-resolve > .show-more');
+      if (historyExpanded && toggle && normalizeText(toggle.textContent) === '收起') {
+        await activateDomainHistoryToggle(toggle, '查看更多');
+      }
+    }
+  }
+
   function subdomainRadios() {
     return [...document.querySelectorAll('[role="radio"]')].filter((radio) => /子域名/.test(normalizeText(radio.textContent)));
   }
@@ -384,8 +472,7 @@
         await switchTab('domain');
         await crawlCurrentTab();
       } else {
-        await switchTab('domain');
-        await crawlCurrentTab();
+        await crawlDomainResolution();
         await crawlSubdomains();
       }
       setStatus(`提取完成，共 ${state.records.size} 条关联记录`, state.errors.length ? 'warning' : 'success');
