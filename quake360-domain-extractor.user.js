@@ -39,6 +39,7 @@
     targetDomains: 0,
     pageWaitMs: 5000,
     resultPageSize: 12,
+    launcherPosition: null,
   });
   const REVIEW_VALUES = new Set(['pending', 'usable', 'unusable']);
 
@@ -55,6 +56,7 @@
       targetDomains: clampInt(raw.targetDomains, DEFAULT_SETTINGS.targetDomains, 0, 100000),
       pageWaitMs: clampInt(raw.pageWaitMs, DEFAULT_SETTINGS.pageWaitMs, 1500, 30000),
       resultPageSize: clampInt(raw.resultPageSize, DEFAULT_SETTINGS.resultPageSize, 6, 50),
+      launcherPosition: raw.launcherPosition || DEFAULT_SETTINGS.launcherPosition,
     };
   }
 
@@ -349,6 +351,7 @@
       targetDomains: state.ui.targetDomains.value,
       pageWaitMs: state.ui.pageWaitMs.value,
       resultPageSize: state.ui.resultPageSize.value,
+      launcherPosition: state.settings.launcherPosition,
     });
   }
 
@@ -866,6 +869,10 @@
     launcher.type = 'button';
     launcher.className = 'launcher';
     launcher.textContent = '域名提取与审核';
+    if (state.settings.launcherPosition) {
+      launcher.style.right = state.settings.launcherPosition.right;
+      launcher.style.bottom = state.settings.launcherPosition.bottom;
+    }
 
     const panel = document.createElement('section');
     panel.className = 'panel';
@@ -1003,6 +1010,10 @@
 
       const onMouseUp = () => {
         launcher.style.transition = '';
+        if (isDragging) {
+          state.settings.launcherPosition = { right: launcher.style.right, bottom: launcher.style.bottom };
+          writeStoredJson(SETTINGS_KEY, state.settings);
+        }
         document.removeEventListener('mousemove', onMouseMove);
         document.removeEventListener('mouseup', onMouseUp);
       };
