@@ -81,13 +81,28 @@ test('normalizeSettings clamps unsafe pagination values', () => {
     maxPages: '0',
     targetDomains: '-12',
     pageWaitMs: '200',
+    pageDelayMinMs: '3000',
+    pageDelayMaxMs: '1000',
     resultPageSize: '999',
   });
 
   assert.equal(settings.maxPages, 1);
   assert.equal(settings.targetDomains, 0);
   assert.equal(settings.pageWaitMs, 1500);
+  assert.equal(settings.pageDelayMinMs, 1000);
+  assert.equal(settings.pageDelayMaxMs, 3000);
   assert.equal(settings.resultPageSize, 50);
+});
+
+test('randomPageDelayMs stays within configured inclusive range', () => {
+  const { randomPageDelayMs } = loadTestApi();
+  const samples = [0, 0.01, 0.5, 0.99, 1].map((value) => randomPageDelayMs(1000, 3000, () => value));
+
+  for (const delay of samples) {
+    assert.ok(delay >= 1000 && delay <= 3000);
+  }
+  assert.equal(randomPageDelayMs(1000, 3000, () => 0), 1000);
+  assert.equal(randomPageDelayMs(1000, 3000, () => 1), 3000);
 });
 
 test('page transition state only changes for a non-empty new page', () => {
