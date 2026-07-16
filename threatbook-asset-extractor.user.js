@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微步关联资产提取器
 // @namespace    local.codex.threatbook
-// @version      1.2.0
-// @description  提取微步 IP/域名情报页面中的关联域名和 IP，并导出 CSV/JSON。
+// @version      1.2.1
+// @description  提取微步 IP/域名情报页面中的关联域名和 IP，并导出 CSV/JSON。表格翻页默认随机间隔 1–3 秒。
 // @author       Codex
 // @match        https://x.threatbook.com/v5/ip/*
 // @match        https://x.threatbook.com/v5/domain/*
@@ -20,10 +20,46 @@
   const MAX_PAGES = 150;
   const WAIT_TIMEOUT = 15000;
   const PAGE_SETTLE_MS = 250;
+  const DEFAULT_CONFIG = Object.freeze({
+    pageDelayMinMs: 1000,
+    pageDelayMaxMs: 3000,
+    launcherPosition: null,
+  });
   const DOMAIN_PATH = /\/v5\/domain\/([^/?#]+)/i;
   const IP_PATH = /\/v5\/ip\/([^/?#]+)/i;
   const IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$/;
   const DATE_PATTERN = /\b\d{4}[-/]\d{2}[-/]\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?\b/;
+
+  function clampInt(value, fallback, min, max) {
+    const parsed = Number.parseInt(String(value), 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(max, Math.max(min, parsed));
+  }
+
+  function randomPageDelayMs(minMs, maxMs, randomFn = Math.random) {
+    const min = clampInt(minMs, DEFAULT_CONFIG.pageDelayMinMs, 0, 60000);
+    const max = clampInt(maxMs, DEFAULT_CONFIG.pageDelayMaxMs, 0, 60000);
+    const low = Math.min(min, max);
+    const high = Math.max(min, max);
+    if (high <= low) return low;
+    const span = high - low + 1;
+    return Math.min(high, low + Math.floor(randomFn() * span));
+  }
+
+  function normalizeConfig(raw = {}) {
+    let pageDelayMinMs = clampInt(raw.pageDelayMinMs, DEFAULT_CONFIG.pageDelayMinMs, 0, 60000);
+    let pageDelayMaxMs = clampInt(raw.pageDelayMaxMs, DEFAULT_CONFIG.pageDelayMaxMs, 0, 60000);
+    if (pageDelayMinMs > pageDelayMaxMs) {
+      const swap = pageDelayMinMs;
+      pageDelayMinMs = pageDelayMaxMs;
+      pageDelayMaxMs = swap;
+    }
+    return {
+      pageDelayMinMs,
+      pageDelayMaxMs,
+      launcherPosition: raw.launcherPosition || DEFAULT_CONFIG.launcherPosition,
+    };
+  }
 
   const state = {
     running: false,
@@ -59,6 +95,13 @@
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function sleepCancellable(ms) {
+    const startedAt = Date.now();
+    while (!state.cancelled && Date.now() - startedAt < ms) {
+      await sleep(Math.min(200, ms - (Date.now() - startedAt)));
+    }
   }
 
   async function waitFor(predicate, timeout = WAIT_TIMEOUT, interval = 100) {
@@ -299,9 +342,15 @@
       }
 
       visited += 1;
+      if (state.cancelled) break;
       const pagination = scope.querySelector('.x-antd-comp-pagination');
       const next = pagination?.querySelector('.x-antd-comp-pagination-next');
       if (!next || next.getAttribute('aria-disabled') === 'true' || next.classList.contains('x-antd-comp-pagination-disabled')) break;
+
+      const delayMs = randomPageDelayMs(state.config.pageDelayMinMs, state.config.pageDelayMaxMs);
+      setStatus(`正在提取 ${sourceLabel(source)} · 第 ${page} 页完成，随机等待 ${(delayMs / 1000).toFixed(1)}s 后翻页…`, 'working');
+      await sleepCancellable(delayMs);
+      if (state.cancelled) break;
 
       const before = pageSignature(table);
       next.querySelector('button')?.click();
@@ -466,6 +515,7 @@
 
   async function runExtraction() {
     if (state.running) return;
+    saveDelaySettingsFromUi();
     state.query = readQuery();
     if (state.query.type === 'unknown') {
       setStatus('请先打开微步 IP 或域名详情页', 'error');
@@ -618,18 +668,31 @@
   function loadConfig() {
     try {
       const value = JSON.parse(localStorage.getItem(CONFIG_STORAGE_KEY) || '{}');
-      return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+      return normalizeConfig(value && typeof value === 'object' && !Array.isArray(value) ? value : {});
     } catch {
-      return {};
+      return normalizeConfig({});
     }
   }
 
   function saveConfig() {
     try {
+      state.config = normalizeConfig(state.config);
       localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(state.config));
     } catch (error) {
       console.warn('[微步关联资产提取器] 无法保存配置', error);
     }
+  }
+
+  function saveDelaySettingsFromUi() {
+    if (!state.ui) return;
+    state.config = normalizeConfig({
+      ...state.config,
+      pageDelayMinMs: state.ui.pageDelayMinMs.value,
+      pageDelayMaxMs: state.ui.pageDelayMaxMs.value,
+    });
+    state.ui.pageDelayMinMs.value = String(state.config.pageDelayMinMs);
+    state.ui.pageDelayMaxMs.value = String(state.config.pageDelayMaxMs);
+    saveConfig();
   }
 
   function escapeHtml(value) {
@@ -947,6 +1010,8 @@
     state.ui.stop.hidden = !running;
     state.ui.expandHistory.disabled = running;
     state.ui.includeInactive.disabled = running;
+    state.ui.pageDelayMinMs.disabled = running;
+    state.ui.pageDelayMaxMs.disabled = running;
     updateStats();
   }
 
@@ -986,6 +1051,9 @@
       .status[data-tone="error"] { border-color: var(--red); background: #fff1f1; color: #95161b; }
       .options { display: flex; flex-wrap: wrap; gap: 12px 18px; margin-bottom: 12px; color: var(--ink-soft); font-size: 12px; }
       .check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+      .setting-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; width: 100%; }
+      .setting-field { display: grid; gap: 2px; color: var(--muted); font-size: 10px; }
+      .setting-field input { width: 100%; height: 26px; border: 1px solid var(--line); border-radius: 3px; padding: 0 6px; background: var(--paper); color: var(--ink); font: 500 11px/1 var(--font-mono); outline: none; }
       .check input { width: 14px; height: 14px; accent-color: var(--accent); }
       .actions { display: flex; gap: 8px; }
       .button { min-height: 34px; border: 1px solid var(--line); border-radius: 4px; padding: 0 12px; background: var(--paper); color: var(--ink-soft); cursor: pointer; transition: all .15s; font-size: 12px; }
@@ -1159,6 +1227,10 @@
         <div class="options">
           <label class="check"><input data-option="history" type="checkbox" checked>展开历史详情</label>
           <label class="check"><input data-option="inactive" type="checkbox" checked>失效子域名</label>
+          <div class="setting-grid">
+            <label class="setting-field">翻页间隔最小 ms<input type="number" min="0" max="60000" step="100" data-setting="pageDelayMinMs"></label>
+            <label class="setting-field">翻页间隔最大 ms<input type="number" min="0" max="60000" step="100" data-setting="pageDelayMaxMs"></label>
+          </div>
         </div>
         <div class="actions">
           <button class="button primary" data-action="start" type="button">开始提取</button>
@@ -1241,6 +1313,8 @@
       ipCount: get('[data-stat="ips"]'),
       expandHistory: get('[data-option="history"]'),
       includeInactive: get('[data-option="inactive"]'),
+      pageDelayMinMs: get('[data-setting="pageDelayMinMs"]'),
+      pageDelayMaxMs: get('[data-setting="pageDelayMaxMs"]'),
       resultButtons: [...shadow.querySelectorAll('[data-action="csv"],[data-action="json"],[data-action="domains"],[data-action="ips"],[data-action="view-results"]')],
       resultOverlay,
       resultList: get('.result-list'),
@@ -1261,6 +1335,8 @@
 
     get('.badge').textContent = state.query.type === 'ip' ? 'IP' : '域名';
     get('.query-value').textContent = state.query.value || '未识别';
+    state.ui.pageDelayMinMs.value = String(state.config.pageDelayMinMs);
+    state.ui.pageDelayMaxMs.value = String(state.config.pageDelayMaxMs);
 
     let isDragging = false;
     launcher.addEventListener('mousedown', (e) => {

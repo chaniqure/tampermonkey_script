@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Quake360 结果 URL 提取与过滤
 // @namespace    http://tampermonkey.net/
-// @version      1.4.1
-// @description  提取 quake 搜索结果中的标题与 URL，支持多页抓取、可用性检测与表格导出，支持跳过指定 URL 的校验
+// @version      1.4.2
+// @description  提取 quake 搜索结果中的标题与 URL，支持多页抓取、可用性检测与表格导出，支持跳过指定 URL 的校验；自动翻页默认随机间隔 1–3 秒
 // @author       you
 // @match        *://quake.360.net/*
 // @match        *://quake.360.cn/*
@@ -45,6 +45,8 @@
         maxPages: 1,
         targetCount: 100,
         pageWaitMs: 2000,
+        pageDelayMinMs: 1000,
+        pageDelayMaxMs: 3000,
 
         // 校验触发方式: auto=提取时自动校验, manual=弹窗后手动点按钮校验
         checkTrigger: 'manual',
@@ -90,6 +92,13 @@
         r.maxPages = clampInt(r.maxPages, DEFAULT_RULES.maxPages, 1, 999);
         r.targetCount = clampInt(r.targetCount, DEFAULT_RULES.targetCount, 0, 100000);
         r.pageWaitMs = clampInt(r.pageWaitMs, DEFAULT_RULES.pageWaitMs, 500, 15000);
+        r.pageDelayMinMs = clampInt(r.pageDelayMinMs, DEFAULT_RULES.pageDelayMinMs, 0, 60000);
+        r.pageDelayMaxMs = clampInt(r.pageDelayMaxMs, DEFAULT_RULES.pageDelayMaxMs, 0, 60000);
+        if (r.pageDelayMinMs > r.pageDelayMaxMs) {
+            const swap = r.pageDelayMinMs;
+            r.pageDelayMinMs = r.pageDelayMaxMs;
+            r.pageDelayMaxMs = swap;
+        }
         r.availabilityTimeoutMs = clampInt(r.availabilityTimeoutMs, DEFAULT_RULES.availabilityTimeoutMs, 500, 20000);
         r.maxCheckCount = clampInt(r.maxCheckCount, DEFAULT_RULES.maxCheckCount, 0, 100000);
         r.checkConcurrency = clampInt(r.checkConcurrency, DEFAULT_RULES.checkConcurrency, 1, 20);
@@ -215,6 +224,15 @@
     };
 
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+    const randomPageDelayMs = (minMs, maxMs) => {
+        const min = clampInt(minMs, DEFAULT_RULES.pageDelayMinMs, 0, 60000);
+        const max = clampInt(maxMs, DEFAULT_RULES.pageDelayMaxMs, 0, 60000);
+        const low = Math.min(min, max);
+        const high = Math.max(min, max);
+        if (high <= low) return low;
+        return Math.min(high, low + Math.floor(Math.random() * (high - low + 1)));
+    };
 
     // ============== UI 样式 ==============
     const STYLES = {
@@ -460,6 +478,9 @@
 
             if (r.targetCount > 0 && all.length >= r.targetCount) break;
             if (!r.autoPaginate || page >= maxPages) break;
+
+            const delayMs = randomPageDelayMs(r.pageDelayMinMs, r.pageDelayMaxMs);
+            await sleep(delayMs);
 
             const ok = await gotoNextPage(r);
             if (!ok) break;
@@ -877,6 +898,8 @@
         const maxPages = makeNum(cur.maxPages);
         const targetCount = makeNum(cur.targetCount);
         const pageWaitMs = makeNum(cur.pageWaitMs);
+        const pageDelayMinMs = makeNum(cur.pageDelayMinMs);
+        const pageDelayMaxMs = makeNum(cur.pageDelayMaxMs);
         const availabilityTimeoutMs = makeNum(cur.availabilityTimeoutMs);
         const maxCheckCount = makeNum(cur.maxCheckCount);
         const checkConcurrency = makeNum(cur.checkConcurrency);
@@ -903,6 +926,8 @@
             maxPages.value = String(x.maxPages);
             targetCount.value = String(x.targetCount);
             pageWaitMs.value = String(x.pageWaitMs);
+            pageDelayMinMs.value = String(x.pageDelayMinMs);
+            pageDelayMaxMs.value = String(x.pageDelayMaxMs);
             availabilityTimeoutMs.value = String(x.availabilityTimeoutMs);
             maxCheckCount.value = String(x.maxCheckCount);
             checkConcurrency.value = String(x.checkConcurrency);
@@ -978,6 +1003,8 @@
             makeField('最大采集页数（自动翻页时生效）', maxPages),
             makeField('目标采集条数（0=不限）', targetCount),
             makeField('翻页等待毫秒', pageWaitMs),
+            makeField('翻页间隔最小毫秒', pageDelayMinMs),
+            makeField('翻页间隔最大毫秒', pageDelayMaxMs),
             makeField('校验超时毫秒', availabilityTimeoutMs),
             makeField('最多校验条数（0=全部）', maxCheckCount),
             makeField('并发校验数', checkConcurrency)
@@ -1115,6 +1142,8 @@
                 maxPages: maxPages.value,
                 targetCount: targetCount.value,
                 pageWaitMs: pageWaitMs.value,
+                pageDelayMinMs: pageDelayMinMs.value,
+                pageDelayMaxMs: pageDelayMaxMs.value,
                 checkTrigger: autoRadio.checked ? 'auto' : 'manual',
                 checkMode: seqRadio.checked ? 'sequential' : 'concurrent',
                 onlyKeepAvailable: onlyKeepAvailable.checked,

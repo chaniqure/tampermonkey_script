@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FOFA 域名资产提取与人工审核
 // @namespace    local.codex.fofa
-// @version      1.0.0
-// @description  跨页提取 FOFA 搜索结果中的主机/域名，聚合展示、批量打开并由用户人工标记可用性。
+// @version      1.0.1
+// @description  跨页提取 FOFA 搜索结果中的主机/域名，聚合展示、批量打开并由用户人工标记可用性。翻页默认随机间隔 1–3 秒。
 // @author       you
 // @match        *://fofa.info/*
 // @match        *://*.fofa.info/*
@@ -45,6 +45,8 @@
     maxPages: 10,
     targetDomains: 0,
     pageWaitMs: 5000,
+    pageDelayMinMs: 1000,
+    pageDelayMaxMs: 3000,
     resultPageSize: 12,
     launcherPosition: null,
   });
@@ -57,12 +59,31 @@
     return Math.min(max, Math.max(min, parsed));
   }
 
+  function randomPageDelayMs(minMs, maxMs, randomFn = Math.random) {
+    const min = clampInt(minMs, DEFAULT_SETTINGS.pageDelayMinMs, 0, 60000);
+    const max = clampInt(maxMs, DEFAULT_SETTINGS.pageDelayMaxMs, 0, 60000);
+    const low = Math.min(min, max);
+    const high = Math.max(min, max);
+    if (high <= low) return low;
+    const span = high - low + 1;
+    return Math.min(high, low + Math.floor(randomFn() * span));
+  }
+
   function normalizeSettings(raw = {}) {
+    let pageDelayMinMs = clampInt(raw.pageDelayMinMs, DEFAULT_SETTINGS.pageDelayMinMs, 0, 60000);
+    let pageDelayMaxMs = clampInt(raw.pageDelayMaxMs, DEFAULT_SETTINGS.pageDelayMaxMs, 0, 60000);
+    if (pageDelayMinMs > pageDelayMaxMs) {
+      const swap = pageDelayMinMs;
+      pageDelayMinMs = pageDelayMaxMs;
+      pageDelayMaxMs = swap;
+    }
     return {
       autoPaginate: raw.autoPaginate !== false,
       maxPages: clampInt(raw.maxPages, DEFAULT_SETTINGS.maxPages, 1, 200),
       targetDomains: clampInt(raw.targetDomains, DEFAULT_SETTINGS.targetDomains, 0, 100000),
       pageWaitMs: clampInt(raw.pageWaitMs, DEFAULT_SETTINGS.pageWaitMs, 1500, 30000),
+      pageDelayMinMs,
+      pageDelayMaxMs,
       resultPageSize: clampInt(raw.resultPageSize, DEFAULT_SETTINGS.resultPageSize, 6, 50),
       launcherPosition: raw.launcherPosition || DEFAULT_SETTINGS.launcherPosition,
     };
@@ -209,6 +230,7 @@
     normalizeHostHref,
     normalizeSettings,
     pageStateChanged,
+    randomPageDelayMs,
     samePageState,
   };
   if (globalThis.__FDX_TEST_MODE__) {
@@ -254,6 +276,13 @@
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function sleepCancellable(ms) {
+    const startedAt = Date.now();
+    while (!state.cancelled && Date.now() - startedAt < ms) {
+      await sleep(Math.min(200, ms - (Date.now() - startedAt)));
+    }
   }
 
   function escapeHtml(value) {
@@ -428,6 +457,8 @@
       maxPages: state.ui.maxPages.value,
       targetDomains: state.ui.targetDomains.value,
       pageWaitMs: state.ui.pageWaitMs.value,
+      pageDelayMinMs: state.ui.pageDelayMinMs.value,
+      pageDelayMaxMs: state.ui.pageDelayMaxMs.value,
       resultPageSize: state.ui.resultPageSize.value,
       launcherPosition: state.settings.launcherPosition,
     });
@@ -439,6 +470,8 @@
     state.ui.maxPages.value = String(state.settings.maxPages);
     state.ui.targetDomains.value = String(state.settings.targetDomains);
     state.ui.pageWaitMs.value = String(state.settings.pageWaitMs);
+    state.ui.pageDelayMinMs.value = String(state.settings.pageDelayMinMs);
+    state.ui.pageDelayMaxMs.value = String(state.settings.pageDelayMaxMs);
   }
 
   function setStatus(message, tone = 'idle') {
@@ -498,6 +531,11 @@
           setStatus(`采集完成：${state.pagesCollected} 页、${state.assets.length} 个主机`, 'success');
           break;
         }
+
+        const delayMs = randomPageDelayMs(state.settings.pageDelayMinMs, state.settings.pageDelayMaxMs);
+        setStatus(`已完成 ${state.pagesCollected} 页，随机等待 ${(delayMs / 1000).toFixed(1)}s 后翻页…`, 'working');
+        await sleepCancellable(delayMs);
+        if (state.cancelled) break;
 
         setStatus(`已完成 ${state.pagesCollected} 页，正在切换下一页…`, 'working');
         const nextState = await gotoNextPage();
@@ -819,7 +857,7 @@
       .advanced { border-top:1px dashed var(--line); padding-top:6px; }
       .advanced summary { color:var(--muted); font-size:11px; cursor:pointer; user-select:none; }
       .advanced summary:hover { color:var(--ink); }
-      .setting-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; margin-top:6px; }
+      .setting-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:6px; margin-top:6px; }
       .setting-field { display:grid; gap:2px; color:var(--muted); font-size:10px; }
       .setting-field input { width:100%; height:26px; border:1px solid var(--line); border-radius:var(--radius-sm); padding:0 6px; background:var(--paper); color:var(--ink); font:500 11px/1 var(--font-mono); outline:none; transition:border-color .15s; }
       .setting-field input:focus { border-color:var(--ink); }
@@ -983,7 +1021,9 @@
             <div class="setting-grid">
               <label class="setting-field">最多页数<input type="number" min="1" max="200" data-setting="maxPages"></label>
               <label class="setting-field">目标主机（0=不限）<input type="number" min="0" max="100000" data-setting="targetDomains"></label>
-              <label class="setting-field">翻页等待 ms<input type="number" min="1500" max="30000" step="500" data-setting="pageWaitMs"></label>
+              <label class="setting-field">结果稳定等待 ms<input type="number" min="1500" max="30000" step="500" data-setting="pageWaitMs"></label>
+              <label class="setting-field">翻页间隔最小 ms<input type="number" min="0" max="60000" step="100" data-setting="pageDelayMinMs"></label>
+              <label class="setting-field">翻页间隔最大 ms<input type="number" min="0" max="60000" step="100" data-setting="pageDelayMaxMs"></label>
             </div>
           </details>
         </fieldset>
@@ -1042,6 +1082,8 @@
       maxPages: get('[data-setting="maxPages"]'),
       targetDomains: get('[data-setting="targetDomains"]'),
       pageWaitMs: get('[data-setting="pageWaitMs"]'),
+      pageDelayMinMs: get('[data-setting="pageDelayMinMs"]'),
+      pageDelayMaxMs: get('[data-setting="pageDelayMaxMs"]'),
       pageCount: get('[data-stat="pages"]'),
       recordCount: get('[data-stat="records"]'),
       domainCount: get('[data-stat="domains"]'),
@@ -1067,6 +1109,8 @@
     state.ui.maxPages.value = String(state.settings.maxPages);
     state.ui.targetDomains.value = String(state.settings.targetDomains);
     state.ui.pageWaitMs.value = String(state.settings.pageWaitMs);
+    state.ui.pageDelayMinMs.value = String(state.settings.pageDelayMinMs);
+    state.ui.pageDelayMaxMs.value = String(state.settings.pageDelayMaxMs);
     state.ui.resultPageSize.value = String(state.settings.resultPageSize);
 
     let isDragging = false;
