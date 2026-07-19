@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quake360 域名资产提取与人工审核
 // @namespace    local.codex.quake
-// @version      1.1.0
+// @version      1.2.0
 // @description  跨页提取 Quake 搜索结果中的域名，聚合展示、批量打开并由用户人工标记可用性。翻页默认随机间隔 1–3 秒。
 // @author       you
 // @match        *://quake.360.net/*
@@ -36,7 +36,7 @@
   const DEFAULT_SETTINGS = Object.freeze({
     autoPaginate: true,
     maxPages: 10,
-    targetDomains: 0,
+    targetRecords: 0,
     pageWaitMs: 5000,
     pageDelayMinMs: 1000,
     pageDelayMaxMs: 3000,
@@ -44,6 +44,9 @@
     launcherPosition: null,
   });
   const REVIEW_VALUES = new Set(['pending', 'usable', 'unusable']);
+  const RESULT_STABLE_MS = 600;
+  const SEARCH_DEBOUNCE_MS = 180;
+  const BATCH_OPEN_LIMIT = 30;
 
   function clampInt(value, fallback, min, max) {
     const parsed = Number.parseInt(String(value), 10);
@@ -72,7 +75,7 @@
     return {
       autoPaginate: raw.autoPaginate !== false,
       maxPages: clampInt(raw.maxPages, DEFAULT_SETTINGS.maxPages, 1, 200),
-      targetDomains: clampInt(raw.targetDomains, DEFAULT_SETTINGS.targetDomains, 0, 100000),
+      targetRecords: clampInt(raw.targetRecords, DEFAULT_SETTINGS.targetRecords, 0, 100000),
       pageWaitMs: clampInt(raw.pageWaitMs, DEFAULT_SETTINGS.pageWaitMs, 1500, 30000),
       pageDelayMinMs,
       pageDelayMaxMs,
@@ -134,7 +137,9 @@
       }
       const asset = assets.get(domain);
       asset.recordCount += 1;
-      if (record.page) asset.pages.add(Number(record.page));
+      for (const page of record.pages || [record.page]) {
+        if (page) asset.pages.add(Number(page));
+      }
       if (record.url) asset.urls.add(record.url);
       if (record.title) asset.titles.add(record.title);
       if (record.protocol) asset.protocols.add(record.protocol);
@@ -143,7 +148,7 @@
 
     return [...assets.values()].map((asset) => {
       const urls = [...asset.urls];
-      return {
+      const result = {
         domain: asset.domain,
         recordCount: asset.recordCount,
         pages: [...asset.pages].sort((a, b) => a - b),
@@ -153,6 +158,11 @@
         ports: [...asset.ports].sort((a, b) => Number(a) - Number(b)),
         preferredUrl: choosePreferredUrl(urls),
       };
+      Object.defineProperty(result, 'searchText', {
+        value: [result.domain, ...result.titles, ...result.urls, ...result.protocols, ...result.ports, ...result.pages].join(' ').toLowerCase(),
+        enumerable: false,
+      });
+      return result;
     }).sort((a, b) => a.domain.localeCompare(b.domain));
   }
 
@@ -166,7 +176,7 @@
     return (assets || []).filter((asset) => {
       if (review !== 'all' && reviewStatus(asset.domain, reviews) !== review) return false;
       if (!keyword) return true;
-      const searchable = [
+      const searchable = asset.searchText || [
         asset.domain,
         ...(asset.titles || []),
         ...(asset.urls || []),
@@ -216,9 +226,11 @@
     settings: normalizeSettings(readStoredJson(SETTINGS_KEY, DEFAULT_SETTINGS)),
     reviews: readStoredJson(REVIEWS_KEY, {}),
     rawRecords: [],
+    rawRecordCount: 0,
     records: [],
     assets: [],
     prepared: false,
+    preparing: false,
     running: false,
     cancelled: false,
     pagesCollected: 0,
@@ -227,6 +239,7 @@
       review: 'all',
       page: 1,
       pageItems: [],
+      returnFocus: null,
     },
     ui: null,
   };
@@ -286,15 +299,14 @@
     return {
       pageNumber: getActivePageNumber(),
       resultCount: links.length,
-      signature: links.slice(0, 20).map((link) => link.getAttribute('href') || '').join('|'),
+      signature: links.map((link) => link.getAttribute('href') || '').join('|'),
     };
   }
 
   function pageStateChanged(previous, current) {
     if (!current.resultCount || !current.signature) return false;
-    const pageChanged = previous.pageNumber && current.pageNumber && previous.pageNumber !== current.pageNumber;
     const signatureChanged = previous.signature && previous.signature !== current.signature;
-    return Boolean(pageChanged || signatureChanged);
+    return Boolean(signatureChanged);
   }
 
   function samePageState(left, right) {
@@ -307,13 +319,18 @@
   async function waitForStableResults(previous = null, timeoutMs = state.settings.pageWaitMs) {
     const startedAt = Date.now();
     let candidate = null;
+    let candidateSince = 0;
     while (!state.cancelled && Date.now() - startedAt < timeoutMs) {
       const current = getPageState();
       const ready = current.resultCount > 0 && current.signature
         && (!previous || pageStateChanged(previous, current));
       if (ready) {
-        if (samePageState(candidate, current)) return current;
-        candidate = current;
+        if (samePageState(candidate, current)) {
+          if (Date.now() - candidateSince >= RESULT_STABLE_MS) return current;
+        } else {
+          candidate = current;
+          candidateSince = Date.now();
+        }
       }
       await sleep(200);
     }
@@ -363,38 +380,62 @@
 
   function appendPageRecords(records) {
     state.rawRecords.push(...records);
+    state.rawRecordCount = state.rawRecords.length;
   }
 
   function dedupeDomainRecords(records) {
     const recordsByKey = new Map();
     for (const record of records || []) {
-      const key = `${record.page}\n${record.url}`;
-      if (!recordsByKey.has(key)) recordsByKey.set(key, { ...record });
+      const key = record.url;
+      const previous = recordsByKey.get(key);
+      if (previous) {
+        previous.pages.add(record.page);
+        if ((!previous.title || previous.title === '(无标题)') && record.title) previous.title = record.title;
+        if (!previous.port && record.port) previous.port = record.port;
+      } else {
+        recordsByKey.set(key, { ...record, pages: new Set([record.page]) });
+      }
     }
-    return [...recordsByKey.values()].sort((a, b) => {
+    return [...recordsByKey.values()].map((record) => ({
+      ...record,
+      pages: [...record.pages].filter(Boolean).sort((a, b) => a - b),
+      page: Math.min(...record.pages),
+    })).sort((a, b) => {
       return a.page - b.page || a.domain.localeCompare(b.domain) || a.url.localeCompare(b.url);
     });
   }
 
-  function prepareResults() {
-    if (state.running || !state.rawRecords.length) {
-      setStatus(state.running ? '请等待采集结束后再整理结果' : '暂无原始记录，请先开始采集', 'warning');
+  async function prepareResults() {
+    if (state.running || state.preparing || !state.rawRecords.length) {
+      setStatus(state.running || state.preparing ? '请等待当前操作结束后再整理结果' : '暂无原始记录，请先开始采集', 'warning');
       return;
     }
-    setStatus(`正在整理 ${state.rawRecords.length} 条原始记录…`, 'working');
-    state.records = dedupeDomainRecords(state.rawRecords);
-    state.assets = aggregateDomainRecords(state.records);
-    state.prepared = true;
+    state.preparing = true;
     updateStats();
-    setStatus(`整理完成：${state.rawRecords.length} 条原始记录去重为 ${state.records.length} 条，聚合得到 ${state.assets.length} 个域名`, 'success');
-    openResultView();
+    setStatus(`正在整理 ${state.rawRecords.length} 条原始记录…`, 'working');
+    try {
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      state.records = dedupeDomainRecords(state.rawRecords);
+      state.assets = aggregateDomainRecords(state.records);
+      state.rawRecordCount = state.rawRecords.length;
+      state.rawRecords = [];
+      state.prepared = true;
+      setStatus(`整理完成：${state.rawRecordCount} 条原始记录去重为 ${state.records.length} 条，聚合得到 ${state.assets.length} 个域名`, 'success');
+      openResultView();
+    } catch (error) {
+      console.error('[Quake 域名提取器] 整理失败', error);
+      setStatus(`整理失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+    } finally {
+      state.preparing = false;
+      updateStats();
+    }
   }
 
   function settingsFromUi() {
     return normalizeSettings({
       autoPaginate: state.ui.autoPaginate.checked,
       maxPages: state.ui.maxPages.value,
-      targetDomains: state.ui.targetDomains.value,
+      targetRecords: state.ui.targetRecords.value,
       pageWaitMs: state.ui.pageWaitMs.value,
       pageDelayMinMs: state.ui.pageDelayMinMs.value,
       pageDelayMaxMs: state.ui.pageDelayMaxMs.value,
@@ -407,7 +448,7 @@
     state.settings = settingsFromUi();
     writeStoredJson(SETTINGS_KEY, state.settings);
     state.ui.maxPages.value = String(state.settings.maxPages);
-    state.ui.targetDomains.value = String(state.settings.targetDomains);
+    state.ui.targetRecords.value = String(state.settings.targetRecords);
     state.ui.pageWaitMs.value = String(state.settings.pageWaitMs);
     state.ui.pageDelayMinMs.value = String(state.settings.pageDelayMinMs);
     state.ui.pageDelayMaxMs.value = String(state.settings.pageDelayMaxMs);
@@ -421,12 +462,14 @@
 
   function updateStats() {
     if (!state.ui) return;
+    state.ui.start.disabled = state.preparing;
     state.ui.pageCount.textContent = String(state.pagesCollected);
-    state.ui.recordCount.textContent = String(state.rawRecords.length);
+    state.ui.recordCount.textContent = String(state.rawRecordCount);
     state.ui.domainCount.textContent = String(state.assets.length);
-    state.ui.prepare.disabled = state.running || !state.rawRecords.length;
+    state.ui.prepare.disabled = state.running || state.preparing || state.prepared || !state.rawRecords.length;
+    state.ui.rawExport.disabled = state.running || state.preparing || !state.rawRecords.length;
     const hasResults = state.prepared && state.assets.length > 0;
-    for (const button of state.ui.resultActions) button.disabled = !hasResults || state.running;
+    for (const button of state.ui.resultActions) button.disabled = !hasResults || state.running || state.preparing;
     if (!state.ui.resultOverlay.hidden) renderResults();
   }
 
@@ -435,20 +478,16 @@
     state.ui.start.hidden = running;
     state.ui.stop.hidden = !running;
     state.ui.settingsFieldset.disabled = running;
-    state.ui.prepare.disabled = running || !state.rawRecords.length;
+    state.ui.prepare.disabled = running || state.prepared || !state.rawRecords.length;
     updateStats();
   }
 
   async function runExtraction() {
-    if (state.running) return;
+    if (state.running || state.preparing) return;
     saveSettingsFromUi();
-    state.rawRecords = [];
-    state.records = [];
-    state.assets = [];
-    state.prepared = false;
-    state.pagesCollected = 0;
+    if ((state.rawRecordCount || state.records.length || state.assets.length)
+      && !window.confirm('开始新的采集会清空当前结果。是否继续？')) return;
     state.cancelled = false;
-    state.resultView.page = 1;
     setRunning(true);
     setStatus('正在等待当前 Quake 结果页稳定…', 'working');
 
@@ -459,6 +498,16 @@
         return;
       }
 
+      state.rawRecords = [];
+      state.rawRecordCount = 0;
+      state.records = [];
+      state.assets = [];
+      state.prepared = false;
+      state.pagesCollected = 0;
+      state.resultView.page = 1;
+      state.ui.queryValue.textContent = currentSearchQuery();
+      updateStats();
+
       for (let step = 1; step <= state.settings.maxPages && !state.cancelled; step += 1) {
         const pageRecords = extractRecordsFromCurrentPage(step);
         appendPageRecords(pageRecords);
@@ -466,12 +515,12 @@
         updateStats();
         setStatus(`第 ${getActivePageNumber() || step} 页完成：本页 ${pageRecords.length} 条原始记录，累计 ${state.rawRecords.length} 条`, 'working');
 
-        if (state.settings.targetDomains > 0 && state.rawRecords.length >= state.settings.targetDomains) {
-          setStatus(`已达到目标原始记录数 ${state.settings.targetDomains}，采集完成。请点击“整理结果”`, 'success');
+        if (state.settings.targetRecords > 0 && state.rawRecordCount >= state.settings.targetRecords) {
+          setStatus(`已达到目标原始记录数 ${state.settings.targetRecords}，采集完成。请点击“整理结果”`, 'success');
           break;
         }
         if (!state.settings.autoPaginate || step >= state.settings.maxPages) {
-          setStatus(`采集完成：${state.pagesCollected} 页、${state.rawRecords.length} 条原始记录。请点击“整理结果”`, 'success');
+          setStatus(`采集完成：${state.pagesCollected} 页、${state.rawRecordCount} 条原始记录。请点击“整理结果”`, 'success');
           break;
         }
 
@@ -483,15 +532,15 @@
         setStatus(`已完成 ${state.pagesCollected} 页，正在切换下一页…`, 'working');
         const nextState = await gotoNextPage();
         if (!nextState) {
-          setStatus(`已到末页或翻页未在 ${state.settings.pageWaitMs}ms 内稳定，共采集 ${state.rawRecords.length} 条原始记录。请点击“整理结果”`, state.rawRecords.length ? 'success' : 'warning');
+          setStatus(`已到末页或翻页未在 ${state.settings.pageWaitMs}ms 内稳定，共采集 ${state.rawRecordCount} 条原始记录。请点击“整理结果”`, state.rawRecordCount ? 'success' : 'warning');
           break;
         }
       }
 
-      if (state.cancelled) setStatus(`已停止，保留 ${state.rawRecords.length} 条原始记录，可点击“整理结果”`, 'warning');
+      if (state.cancelled) setStatus(`已停止，保留 ${state.rawRecordCount} 条原始记录，可点击“整理结果”`, 'warning');
     } catch (error) {
       console.error('[Quake 域名审核台] 提取失败', error);
-      setStatus(`采集中断：${error.message || error}。已保留 ${state.rawRecords.length} 条原始记录，可点击“整理结果”`, 'error');
+      setStatus(`采集中断：${error.message || error}。已保留 ${state.rawRecordCount} 条原始记录，可点击“整理结果”`, 'error');
     } finally {
       setRunning(false);
     }
@@ -618,6 +667,8 @@
       setStatus('暂无域名，请先开始提取', 'warning');
       return;
     }
+    const active = state.ui.resultOverlay.getRootNode().activeElement;
+    state.resultView.returnFocus = active && !active.disabled ? active : state.ui.resultOpen;
     state.ui.resultOverlay.hidden = false;
     state.resultView.page = 1;
     state.ui.resultSearch.value = state.resultView.query;
@@ -627,6 +678,22 @@
 
   function closeResultView() {
     state.ui.resultOverlay.hidden = true;
+    if (state.resultView.returnFocus?.isConnected && !state.resultView.returnFocus.disabled) state.resultView.returnFocus.focus();
+    state.resultView.returnFocus = null;
+  }
+
+  function trapDialogFocus(event) {
+    if (event.key !== 'Tab' || state.ui.resultOverlay.hidden) return;
+    const focusable = [...state.ui.resultOverlay.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),[tabindex]:not([tabindex="-1"])')]
+      .filter((element) => element.getClientRects().length > 0);
+    if (!focusable.length) return;
+    const active = state.ui.resultOverlay.getRootNode().activeElement;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if ((event.shiftKey && active === first) || (!event.shiftKey && active === last)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    }
   }
 
   function findAsset(domain) {
@@ -651,11 +718,14 @@
   function openAssetBatch(assets, label) {
     const values = unique((assets || []).map((asset) => asset.preferredUrl));
     if (!values.length) return;
-    const warning = `将在后台打开 ${values.length} 个从 Quake 提取的真实网站。\n这些站点可能包含恶意或失陷资产，请仅在隔离环境中访问。\n\n是否继续？`;
+    const limitedValues = values.slice(0, BATCH_OPEN_LIMIT);
+    const omitted = values.length - limitedValues.length;
+    const limitNotice = omitted > 0 ? `\n为保护浏览器，本次只打开前 ${BATCH_OPEN_LIMIT} 个，剩余 ${omitted} 个不会打开。` : '';
+    const warning = `将在后台打开 ${limitedValues.length} 个从 Quake 提取的真实网站。${limitNotice}\n这些站点可能包含恶意或失陷资产，请仅在隔离环境中访问。\n\n是否继续？`;
     if (!window.confirm(warning)) return;
     let opened = 0;
-    for (const url of values) if (openBackgroundTab(url)) opened += 1;
-    setStatus(`已打开 ${opened}/${values.length} 个${label}`, opened === values.length ? 'success' : 'warning');
+    for (const url of limitedValues) if (openBackgroundTab(url)) opened += 1;
+    setStatus(`已打开 ${opened}/${limitedValues.length} 个${label}`, opened === limitedValues.length ? 'success' : 'warning');
   }
 
   async function copyText(text) {
@@ -679,7 +749,8 @@
   }
 
   function csvCell(value) {
-    const text = Array.isArray(value) ? value.join(' | ') : String(value ?? '');
+    let text = Array.isArray(value) ? value.join(' | ') : String(value ?? '');
+    if (/^[=+\-@]/.test(text)) text = `'${text}`;
     return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
   }
 
@@ -699,11 +770,22 @@
     return `\uFEFF${[columns, ...rows.map((row) => columns.map((column) => row[column]))].map((row) => row.map(csvCell).join(',')).join('\r\n')}`;
   }
 
+  function buildRawJson() {
+    return JSON.stringify({
+      exported_at: new Date().toISOString(),
+      source: location.href,
+      pages_collected: state.pagesCollected,
+      raw_records: state.rawRecords,
+    }, null, 2);
+  }
+
   function buildJson() {
     return JSON.stringify({
       exported_at: new Date().toISOString(),
       source: location.href,
       pages_collected: state.pagesCollected,
+      raw_records: state.rawRecordCount,
+      records_after_deduplication: state.records.length,
       domains: state.assets.map((asset) => ({ ...asset, review: getReview(asset.domain) })),
     }, null, 2);
   }
@@ -904,6 +986,15 @@
       .batch-button.primary { background:var(--accent); border-color:var(--accent); color:var(--paper); }
       .batch-button.primary:hover:not(:disabled) { background:var(--accent-hover); border-color:var(--accent-hover); }
       .batch-button:disabled { opacity:.4; cursor:not-allowed; }
+      .launcher { touch-action:none; }
+      button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+
+      @media (prefers-reduced-motion:reduce) {
+        *,*::before,*::after { scroll-behavior:auto !important; animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; }
+      }
+      @media (pointer:coarse) {
+        .launcher,.button,.tool-button,.review-choice,.row-button,.page-button,.batch-button,.result-close { min-height:40px; }
+      }
 
       /* === Responsive === */
       @media (max-width:900px) {
@@ -947,7 +1038,7 @@
           <div class="stat"><strong data-stat="records">0</strong><span>原始记录</span></div>
           <div class="stat"><strong data-stat="domains">0</strong><span>整理域名</span></div>
         </div>
-        <div class="status" data-tone="idle">等待从当前 Quake 结果页提取</div>
+        <div class="status" role="status" aria-live="polite" aria-atomic="true" data-tone="idle">等待从当前 Quake 结果页提取</div>
         <fieldset class="settings">
           <div class="option-line">
             <label class="check"><input type="checkbox" data-setting="autoPaginate">自动翻页，全部提取后统一展示</label>
@@ -956,7 +1047,7 @@
             <summary>采集范围与等待设置</summary>
             <div class="setting-grid">
               <label class="setting-field">最多页数<input type="number" min="1" max="200" data-setting="maxPages"></label>
-              <label class="setting-field">目标原始记录（0=不限）<input type="number" min="0" max="100000" data-setting="targetDomains"></label>
+              <label class="setting-field">目标原始记录（0=不限）<input type="number" min="0" max="100000" data-setting="targetRecords"></label>
               <label class="setting-field">结果稳定等待 ms<input type="number" min="1500" max="30000" step="500" data-setting="pageWaitMs"></label>
               <label class="setting-field">翻页间隔最小 ms<input type="number" min="0" max="60000" step="100" data-setting="pageDelayMinMs"></label>
               <label class="setting-field">翻页间隔最大 ms<input type="number" min="0" max="60000" step="100" data-setting="pageDelayMaxMs"></label>
@@ -970,6 +1061,7 @@
           <button class="button" type="button" data-action="copy" disabled>复制域名</button>
         </div>
         <div class="result-actions">
+          <button class="button" type="button" data-action="raw-json" disabled>原始 JSON</button>
           <button class="button" type="button" data-action="csv" disabled>CSV</button>
           <button class="button" type="button" data-action="json" disabled>JSON</button>
           <button class="button" type="button" data-action="copy-filtered" disabled>复制筛选</button>
@@ -981,7 +1073,7 @@
     resultOverlay.className = 'result-overlay';
     resultOverlay.hidden = true;
     resultOverlay.innerHTML = `
-      <section class="result-modal" role="dialog" aria-modal="true" aria-labelledby="qdx-result-title">
+      <section class="result-modal" role="dialog" aria-modal="true" aria-labelledby="qdx-result-title" tabindex="-1">
         <header class="result-head">
           <div><div class="result-eyebrow">MANUAL ASSET REVIEW / NO NETWORK PROBING</div><h2 class="result-title" id="qdx-result-title">Quake 域名人工审核台</h2><div class="result-subtitle">先批量打开实际采集入口，再由你标记可用、不可用或待确认</div></div>
           <button class="result-close" type="button" data-result-close aria-label="关闭审核台">×</button>
@@ -1014,11 +1106,14 @@
       start: get('[data-action="start"]'),
       stop: get('[data-action="stop"]'),
       prepare: get('[data-action="prepare"]'),
+      rawExport: get('[data-action="raw-json"]'),
+      resultOpen: get('[data-action="review"]'),
       status: get('.status'),
+      queryValue: get('.query-value'),
       settingsFieldset: get('.settings'),
       autoPaginate: get('[data-setting="autoPaginate"]'),
       maxPages: get('[data-setting="maxPages"]'),
-      targetDomains: get('[data-setting="targetDomains"]'),
+      targetRecords: get('[data-setting="targetRecords"]'),
       pageWaitMs: get('[data-setting="pageWaitMs"]'),
       pageDelayMinMs: get('[data-setting="pageDelayMinMs"]'),
       pageDelayMaxMs: get('[data-setting="pageDelayMaxMs"]'),
@@ -1042,18 +1137,18 @@
       markStatus: get('[data-mark-status]'),
     };
 
-    get('.query-value').textContent = currentSearchQuery();
+    state.ui.queryValue.textContent = currentSearchQuery();
     state.ui.autoPaginate.checked = state.settings.autoPaginate;
     state.ui.maxPages.value = String(state.settings.maxPages);
-    state.ui.targetDomains.value = String(state.settings.targetDomains);
+    state.ui.targetRecords.value = String(state.settings.targetRecords);
     state.ui.pageWaitMs.value = String(state.settings.pageWaitMs);
     state.ui.pageDelayMinMs.value = String(state.settings.pageDelayMinMs);
     state.ui.pageDelayMaxMs.value = String(state.settings.pageDelayMaxMs);
     state.ui.resultPageSize.value = String(state.settings.resultPageSize);
 
     let isDragging = false;
-    launcher.addEventListener('mousedown', (e) => {
-      if (e.button !== 0) return;
+    launcher.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 || !e.isPrimary) return;
       isDragging = false;
       const startX = e.clientX;
       const startY = e.clientY;
@@ -1080,12 +1175,14 @@
           state.settings.launcherPosition = { right: launcher.style.right, bottom: launcher.style.bottom };
           writeStoredJson(SETTINGS_KEY, state.settings);
         }
-        document.removeEventListener('mousemove', onMouseMove);
-        document.removeEventListener('mouseup', onMouseUp);
+        document.removeEventListener('pointermove', onMouseMove);
+        document.removeEventListener('pointerup', onMouseUp);
+        document.removeEventListener('pointercancel', onMouseUp);
       };
 
-      document.addEventListener('mousemove', onMouseMove);
-      document.addEventListener('mouseup', onMouseUp);
+      document.addEventListener('pointermove', onMouseMove);
+      document.addEventListener('pointerup', onMouseUp);
+      document.addEventListener('pointercancel', onMouseUp);
     });
 
     launcher.addEventListener('click', (e) => {
@@ -1129,6 +1226,7 @@
       setStatus('正在停止，等待当前翻页操作结束…', 'warning');
     });
     get('[data-action="copy"]').addEventListener('click', () => copyDomains());
+    get('[data-action="raw-json"]').addEventListener('click', () => download(buildRawJson(), 'raw.json', 'application/json;charset=utf-8'));
     get('[data-action="csv"]').addEventListener('click', () => download(buildCsv(), 'csv', 'text/csv;charset=utf-8'));
     get('[data-action="json"]').addEventListener('click', () => download(buildJson(), 'json', 'application/json;charset=utf-8'));
     get('[data-action="copy-filtered"]').addEventListener('click', () => copyDomains(filteredAssets()));
@@ -1158,14 +1256,17 @@
       } else if (button.hasAttribute('data-mark-current')) {
         const choice = state.ui.markStatus.value;
         if (!REVIEW_VALUES.has(choice)) return;
-        for (const asset of state.resultView.pageItems) setReview(asset.domain, choice, false);
+        for (const asset of state.resultView.pageItems) state.reviews[asset.domain.toLowerCase()] = choice;
+        saveReviews();
         renderResults();
       }
     });
+    let searchTimer = 0;
     state.ui.resultSearch.addEventListener('input', (event) => {
       state.resultView.query = event.target.value;
       state.resultView.page = 1;
-      renderResults();
+      clearTimeout(searchTimer);
+      searchTimer = window.setTimeout(renderResults, SEARCH_DEBOUNCE_MS);
     });
     state.ui.resultPageSize.addEventListener('change', (event) => {
       state.settings.resultPageSize = clampInt(event.target.value, DEFAULT_SETTINGS.resultPageSize, 6, 50);
@@ -1175,6 +1276,7 @@
     });
     shadow.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && !resultOverlay.hidden) closeResultView();
+      else trapDialogFocus(event);
     });
   }
 

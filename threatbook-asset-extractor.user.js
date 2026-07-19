@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微步关联资产提取器
 // @namespace    local.codex.threatbook
-// @version      1.3.0
+// @version      1.4.0
 // @description  提取微步 IP/域名情报页面中的关联域名和 IP，并导出 CSV/JSON。表格翻页默认随机间隔 1–3 秒。
 // @author       Codex
 // @match        https://x.threatbook.com/v5/ip/*
@@ -20,6 +20,7 @@
   const MAX_PAGES = 150;
   const WAIT_TIMEOUT = 15000;
   const PAGE_SETTLE_MS = 250;
+  const SEARCH_DEBOUNCE_MS = 180;
   const DEFAULT_CONFIG = Object.freeze({
     pageDelayMinMs: 1000,
     pageDelayMaxMs: 3000,
@@ -65,6 +66,7 @@
     running: false,
     cancelled: false,
     rawRecords: [],
+    rawRecordCount: 0,
     records: [],
     recordItems: [],
     domainAssets: [],
@@ -72,6 +74,7 @@
     domains: [],
     ips: [],
     prepared: false,
+    preparing: false,
     errors: [],
     originalTab: '',
     query: readQuery(),
@@ -85,6 +88,7 @@
       query: '',
       review: 'all',
       pageItems: [],
+      returnFocus: null,
     },
   };
 
@@ -210,6 +214,7 @@
     };
     if (!record.domain && !record.ip) return;
     state.rawRecords.push(record);
+    state.rawRecordCount = state.rawRecords.length;
   }
 
   function extractRow(row, headers, source, observedAtOverride = '') {
@@ -253,6 +258,13 @@
     return dataRows(table).map((row) => normalizeText(row.textContent)).join('\n');
   }
 
+  function scopeTableSignature(scope) {
+    return [...scope.querySelectorAll('table')]
+      .filter((table) => dataRows(table).length > 0)
+      .map((table) => `${tableHeaders(table).join('|')}\n${pageSignature(table)}`)
+      .join('\n---\n');
+  }
+
   function findPaginationScope(table) {
     let current = table;
     for (let depth = 0; depth < 12 && current; depth += 1, current = current.parentElement) {
@@ -278,9 +290,10 @@
     const pagination = scope?.querySelector('.x-antd-comp-pagination');
     const pageOne = pagination?.querySelector('.x-antd-comp-pagination-item[title="1"]');
     if (!pageOne || currentPageNumber(pagination) === 1) return;
-    const before = normalizeText(pagination.querySelector('.x-antd-comp-pagination-item-active')?.textContent);
+    const before = scopeTableSignature(scope);
     pageOne.click();
-    await waitFor(() => normalizeText(pagination.querySelector('.x-antd-comp-pagination-item-active')?.textContent) !== before);
+    await waitFor(() => currentPageNumber(pagination) === 1 && scopeTableSignature(scope) !== before);
+    await sleep(PAGE_SETTLE_MS);
   }
 
   async function expandHiddenRowDetails(table, source) {
@@ -513,17 +526,20 @@
   }
 
   async function runExtraction() {
-    if (state.running) return;
+    if (state.running || state.preparing) return;
     saveDelaySettingsFromUi();
     state.query = readQuery();
     if (state.query.type === 'unknown') {
       setStatus('请先打开微步 IP 或域名详情页', 'error');
       return;
     }
+    if ((state.rawRecordCount || state.records.length)
+      && !window.confirm('开始新的采集会清空当前结果。是否继续？')) return;
 
     state.running = true;
     state.cancelled = false;
     state.rawRecords = [];
+    state.rawRecordCount = 0;
     state.records = [];
     state.recordItems = [];
     state.domainAssets = [];
@@ -533,6 +549,8 @@
     state.prepared = false;
     state.errors = [];
     state.originalTab = document.querySelector('#analysisControllUl > li.active')?.getAttribute('data-tab-name') || '';
+    state.ui.badge.textContent = state.query.type === 'ip' ? 'IP' : '域名';
+    state.ui.queryValue.textContent = state.query.value || '未识别';
     setControlsRunning(true);
     updateStats();
 
@@ -544,13 +562,13 @@
         await crawlDomainResolution();
         await crawlSubdomains();
       }
-      setStatus(`采集完成，共 ${state.rawRecords.length} 条原始记录。请点击“整理结果”执行去重和排序`, state.errors.length ? 'warning' : 'success');
+      setStatus(`采集完成，共 ${state.rawRecordCount} 条原始记录。请点击“整理结果”执行去重和排序`, state.errors.length ? 'warning' : 'success');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (state.cancelled) setStatus(`已停止，保留 ${state.rawRecords.length} 条原始记录，可点击“整理结果”`, 'warning');
+      if (state.cancelled) setStatus(`已停止，保留 ${state.rawRecordCount} 条原始记录，可点击“整理结果”`, 'warning');
       else {
         state.errors.push(message);
-        setStatus(`采集中断：${message}。已保留 ${state.rawRecords.length} 条原始记录，可点击“整理结果”`, 'error');
+        setStatus(`采集中断：${message}。已保留 ${state.rawRecordCount} 条原始记录，可点击“整理结果”`, 'error');
         console.error('[微步关联资产提取器]', error);
       }
     } finally {
@@ -595,22 +613,41 @@
     });
   }
 
-  function prepareResults() {
-    if (state.running || !state.rawRecords.length) {
-      setStatus(state.running ? '请等待采集结束后再整理结果' : '暂无原始记录，请先开始采集', 'warning');
+  async function prepareResults() {
+    if (state.running || state.preparing || !state.rawRecords.length) {
+      setStatus(state.running || state.preparing ? '请等待当前操作结束后再整理结果' : '暂无原始记录，请先开始采集', 'warning');
       return;
     }
-    setStatus(`正在整理 ${state.rawRecords.length} 条原始记录…`, 'working');
-    state.records = prepareCollectedRecords(state.rawRecords);
-    state.recordItems = state.records.map((record, index) => ({ ...record, kind: 'record', resultIndex: index }));
-    state.domainAssets = aggregateAssets('domain');
-    state.ipAssets = aggregateAssets('ip');
-    state.domains = state.domainAssets.map((entry) => entry.value);
-    state.ips = state.ipAssets.map((entry) => entry.value);
-    state.prepared = true;
+    state.preparing = true;
     updateStats();
-    setStatus(`整理完成：${state.rawRecords.length} 条原始记录去重为 ${state.records.length} 条，得到 ${state.domains.length} 个域名和 ${state.ips.length} 个 IP`, 'success');
-    openResultView();
+    setStatus(`正在整理 ${state.rawRecords.length} 条原始记录…`, 'working');
+    try {
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      state.records = prepareCollectedRecords(state.rawRecords);
+      state.records.forEach((record, index) => {
+        Object.defineProperties(record, {
+          kind: { value: 'record', enumerable: false },
+          resultIndex: { value: index, enumerable: false },
+          searchText: { value: resultSearchText(record), enumerable: false },
+        });
+      });
+      state.recordItems = state.records;
+      state.domainAssets = aggregateAssets('domain');
+      state.ipAssets = aggregateAssets('ip');
+      state.domains = state.domainAssets.map((entry) => entry.value);
+      state.ips = state.ipAssets.map((entry) => entry.value);
+      state.rawRecordCount = state.rawRecords.length;
+      state.rawRecords = [];
+      state.prepared = true;
+      setStatus(`整理完成：${state.rawRecordCount} 条原始记录去重为 ${state.records.length} 条，得到 ${state.domains.length} 个域名和 ${state.ips.length} 个 IP`, 'success');
+      openResultView();
+    } catch (error) {
+      console.error('[微步关联资产提取器] 整理失败', error);
+      setStatus(`整理失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+    } finally {
+      state.preparing = false;
+      updateStats();
+    }
   }
 
   function csvCell(value) {
@@ -634,7 +671,7 @@
       page_url: location.href,
       generated_at: new Date().toISOString(),
       summary: {
-        raw_records: state.rawRecords.length,
+        raw_records: state.rawRecordCount,
         records: state.records.length,
         domains: distinctAssets('domain').length,
         ips: distinctAssets('ip').length,
@@ -647,12 +684,22 @@
     }, null, 2);
   }
 
+  function buildRawJson() {
+    return JSON.stringify({
+      query: state.query,
+      page_url: location.href,
+      generated_at: new Date().toISOString(),
+      raw_records: state.rawRecords,
+      warnings: state.errors,
+    }, null, 2);
+  }
+
   function safeFilePart(value) {
     return String(value || 'result').replace(/[\\/:*?"<>|]/g, '_');
   }
 
-  function download(content, extension, mimeType) {
-    if (!state.prepared || !state.records.length) {
+  function download(content, extension, mimeType, requirePrepared = true) {
+    if (requirePrepared && (!state.prepared || !state.records.length)) {
       setStatus('结果尚未整理，请先点击“整理结果”', 'warning');
       return;
     }
@@ -807,19 +854,24 @@
       if (record.usage) entry.usages.add(record.usage);
       if (record.observed_at > entry.latest) entry.latest = record.observed_at;
     }
-    return [...entries.values()].map((entry) => ({
-      ...entry,
-      domains: [...entry.domains].sort(),
-      ips: [...entry.ips].sort(),
-      sources: [...entry.sources].sort(),
-      verdicts: [...entry.verdicts].sort(),
-      locations: [...entry.locations].sort(),
-      providers: [...entry.providers].sort(),
-      usages: [...entry.usages].sort(),
-    })).sort((a, b) => a.value.localeCompare(b.value));
+    return [...entries.values()].map((entry) => {
+      const result = {
+        ...entry,
+        domains: [...entry.domains].sort(),
+        ips: [...entry.ips].sort(),
+        sources: [...entry.sources].sort(),
+        verdicts: [...entry.verdicts].sort(),
+        locations: [...entry.locations].sort(),
+        providers: [...entry.providers].sort(),
+        usages: [...entry.usages].sort(),
+      };
+      Object.defineProperty(result, 'searchText', { value: resultSearchText(result), enumerable: false });
+      return result;
+    }).sort((a, b) => a.value.localeCompare(b.value));
   }
 
   function resultSearchText(item) {
+    if (item.searchText) return item.searchText;
     if (item.kind === 'record') {
       return [item.domain, item.ip, item.source_label, item.observed_at, item.verdict, item.location, item.provider, item.usage, item.row_text].join(' ').toLowerCase();
     }
@@ -835,7 +887,7 @@
 
     const keyword = normalizeText(query).toLowerCase();
     return items.filter((item) => {
-      if (keyword && !resultSearchText(item).includes(keyword)) return false;
+      if (keyword && !item.searchText.includes(keyword)) return false;
       if (tab === 'domains' && review !== 'all' && domainReview(item.value) !== review) return false;
       return true;
     });
@@ -1019,6 +1071,8 @@
       setStatus('结果尚未整理，请先点击“整理结果”', 'warning');
       return;
     }
+    const active = state.ui.resultOverlay.getRootNode().activeElement;
+    state.resultView.returnFocus = active && !active.disabled ? active : state.ui.resultOpen;
     state.ui.resultOverlay.hidden = false;
     state.resultView.page = 1;
     state.ui.resultSearch.value = state.resultView.query;
@@ -1028,14 +1082,32 @@
 
   function closeResultView() {
     if (state.ui?.resultOverlay) state.ui.resultOverlay.hidden = true;
+    if (state.resultView.returnFocus?.isConnected && !state.resultView.returnFocus.disabled) state.resultView.returnFocus.focus();
+    state.resultView.returnFocus = null;
+  }
+
+  function trapDialogFocus(event) {
+    if (event.key !== 'Tab' || state.ui.resultOverlay.hidden) return;
+    const focusable = [...state.ui.resultOverlay.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),[tabindex]:not([tabindex="-1"])')]
+      .filter((element) => element.getClientRects().length > 0);
+    if (!focusable.length) return;
+    const active = state.ui.resultOverlay.getRootNode().activeElement;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if ((event.shiftKey && active === first) || (!event.shiftKey && active === last)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    }
   }
 
   function updateStats() {
     if (!state.ui) return;
-    state.ui.recordCount.textContent = String(state.rawRecords.length);
+    state.ui.start.disabled = state.preparing;
+    state.ui.recordCount.textContent = String(state.rawRecordCount);
     state.ui.domainCount.textContent = String(state.domains.length);
     state.ui.ipCount.textContent = String(state.ips.length);
-    state.ui.prepare.disabled = state.running || !state.rawRecords.length;
+    state.ui.prepare.disabled = state.running || state.preparing || !state.rawRecords.length;
+    state.ui.rawExport.disabled = state.running || state.preparing || !state.rawRecords.length;
     const enabled = state.prepared && state.records.length > 0 && !state.running;
     for (const button of state.ui.resultButtons) button.disabled = !enabled;
     if (!state.ui.resultOverlay.hidden && !state.running) renderResultView();
@@ -1098,12 +1170,12 @@
       .setting-field { display: grid; gap: 2px; color: var(--muted); font-size: 10px; }
       .setting-field input { width: 100%; height: 26px; border: 1px solid var(--line); border-radius: 3px; padding: 0 6px; background: var(--paper); color: var(--ink); font: 500 11px/1 var(--font-mono); outline: none; }
       .check input { width: 14px; height: 14px; accent-color: var(--accent); }
-      .actions { display: flex; gap: 8px; }
+      .actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
       .button { min-height: 34px; border: 1px solid var(--line); border-radius: 4px; padding: 0 12px; background: var(--paper); color: var(--ink-soft); cursor: pointer; transition: all .15s; font-size: 12px; }
       .button:hover:not(:disabled) { border-color: var(--muted); background: var(--bg); color: var(--ink); }
-      .button.primary { flex: 1; border-color: var(--accent); background: var(--accent); color: var(--paper); font-weight: 600; }
+      .button.primary { border-color: var(--accent); background: var(--accent); color: var(--paper); font-weight: 600; }
       .button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
-      .button.danger { flex: 1; border-color: var(--red); background: var(--red); color: var(--paper); font-weight: 600; }
+      .button.danger { border-color: var(--red); background: var(--red); color: var(--paper); font-weight: 600; }
       .button:disabled { cursor: not-allowed; opacity: .42; }
       .results { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
       [data-action="view-results"] { grid-column: 1 / -1; min-height: 40px; border-color: var(--accent); background: var(--accent-bg); color: var(--accent-hover); font-weight: 600; }
@@ -1206,6 +1278,15 @@
       .batch-button.primary { background: var(--accent); border-color: var(--accent); color: var(--paper); }
       .batch-button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
       .batch-button:disabled { cursor: not-allowed; opacity: .4; }
+      .launcher { touch-action: none; }
+      button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+      }
+      @media (pointer: coarse) {
+        .launcher, .button, .result-tab, .filter-button, .review-choice, .row-button, .page-button, .batch-button, .result-close { min-height: 40px; }
+      }
 
       @media (max-width: 900px) {
         .result-modal { width: calc(100vw - 16px); height: calc(100vh - 16px); }
@@ -1266,7 +1347,7 @@
           <div class="stat"><strong class="number" data-stat="domains">0</strong><span class="label">整理域名</span></div>
           <div class="stat"><strong class="number" data-stat="ips">0</strong><span class="label">整理 IP</span></div>
         </div>
-        <div class="status" data-tone="idle">等待提取</div>
+        <div class="status" role="status" aria-live="polite" aria-atomic="true" data-tone="idle">等待提取</div>
         <div class="options">
           <label class="check"><input data-option="history" type="checkbox" checked>展开历史详情</label>
           <label class="check"><input data-option="inactive" type="checkbox" checked>失效子域名</label>
@@ -1279,6 +1360,7 @@
           <button class="button primary" data-action="start" type="button">开始提取</button>
           <button class="button danger" data-action="stop" type="button" hidden>停止</button>
           <button class="button primary" data-action="prepare" type="button" disabled>整理结果</button>
+          <button class="button" data-action="raw-json" type="button" disabled>原始 JSON</button>
           <button class="button" data-action="csv" type="button" disabled>CSV</button>
           <button class="button" data-action="json" type="button" disabled>JSON</button>
         </div>
@@ -1294,7 +1376,7 @@
     resultOverlay.className = 'result-overlay';
     resultOverlay.hidden = true;
     resultOverlay.innerHTML = `
-      <section class="result-modal" role="dialog" aria-modal="true" aria-labelledby="tb-result-title">
+      <section class="result-modal" role="dialog" aria-modal="true" aria-labelledby="tb-result-title" tabindex="-1">
         <header class="result-head">
           <div class="result-heading">
             <div class="result-eyebrow">ASSET REVIEW CONSOLE</div>
@@ -1352,7 +1434,11 @@
       start: get('[data-action="start"]'),
       stop: get('[data-action="stop"]'),
       prepare: get('[data-action="prepare"]'),
+      rawExport: get('[data-action="raw-json"]'),
+      resultOpen: get('[data-action="view-results"]'),
       status: get('.status'),
+      badge: get('.badge'),
+      queryValue: get('.query-value'),
       recordCount: get('[data-stat="records"]'),
       domainCount: get('[data-stat="domains"]'),
       ipCount: get('[data-stat="ips"]'),
@@ -1384,8 +1470,8 @@
     state.ui.pageDelayMaxMs.value = String(state.config.pageDelayMaxMs);
 
     let isDragging = false;
-    launcher.addEventListener('mousedown', (e) => {
-      if (e.button !== 0) return;
+    launcher.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 || !e.isPrimary) return;
       isDragging = false;
       const startX = e.clientX;
       const startY = e.clientY;
@@ -1412,12 +1498,14 @@
           state.config.launcherPosition = { right: launcher.style.right, bottom: launcher.style.bottom };
           saveConfig();
         }
-        document.removeEventListener('mousemove', onMouseMove);
-        document.removeEventListener('mouseup', onMouseUp);
+        document.removeEventListener('pointermove', onMouseMove);
+        document.removeEventListener('pointerup', onMouseUp);
+        document.removeEventListener('pointercancel', onMouseUp);
       };
 
-      document.addEventListener('mousemove', onMouseMove);
-      document.addEventListener('mouseup', onMouseUp);
+      document.addEventListener('pointermove', onMouseMove);
+      document.addEventListener('pointerup', onMouseUp);
+      document.addEventListener('pointercancel', onMouseUp);
     });
 
     launcher.addEventListener('click', (e) => {
@@ -1461,6 +1549,7 @@
       state.cancelled = true;
       setStatus('正在停止…', 'warning');
     });
+    get('[data-action="raw-json"]').addEventListener('click', () => download(buildRawJson(), 'raw.json', 'application/json;charset=utf-8', false));
     get('[data-action="csv"]').addEventListener('click', () => download(buildCsv(), 'csv', 'text/csv;charset=utf-8'));
     get('[data-action="json"]').addEventListener('click', () => download(buildJson(), 'json', 'application/json;charset=utf-8'));
     get('[data-action="domains"]').addEventListener('click', () => copyAssets('domain', '域名'));
@@ -1470,10 +1559,12 @@
     resultOverlay.addEventListener('click', (event) => {
       if (event.target === resultOverlay) closeResultView();
     });
+    let searchTimer = 0;
     state.ui.resultSearch.addEventListener('input', (event) => {
       state.resultView.query = event.target.value;
       state.resultView.page = 1;
-      renderResultView();
+      clearTimeout(searchTimer);
+      searchTimer = window.setTimeout(renderResultView, SEARCH_DEBOUNCE_MS);
     });
     state.ui.resultPageSize.addEventListener('change', (event) => {
       state.resultView.pageSize = Number(event.target.value) || RESULT_PAGE_SIZE;
@@ -1508,6 +1599,7 @@
     });
     shadow.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && !resultOverlay.hidden) closeResultView();
+      else trapDialogFocus(event);
     });
   }
 

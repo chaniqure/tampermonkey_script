@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quake360 结果 URL 提取与过滤
 // @namespace    http://tampermonkey.net/
-// @version      1.4.2
+// @version      1.5.0
 // @description  提取 quake 搜索结果中的标题与 URL，支持多页抓取、可用性检测与表格导出，支持跳过指定 URL 的校验；自动翻页默认随机间隔 1–3 秒
 // @author       you
 // @match        *://quake.360.net/*
@@ -11,6 +11,7 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_notification
 // @grant        GM_xmlhttpRequest
+// @grant        GM_openInTab
 // @connect      *
 // @run-at       document-idle
 // ==/UserScript==
@@ -32,6 +33,9 @@
     const TABLE_COLUMN_ORDER = Object.keys(TABLE_COLUMN_DEFS);
     const DEFAULT_VISIBLE_COLUMNS = ['idx', 'page', 'title', 'url', 'host', 'checkStatus', 'checkReason'];
     const DEFAULT_COPY_COLUMNS = ['idx', 'page', 'title', 'url', 'host', 'protocol', 'checkStatus', 'checkReason'];
+    const RESULT_PAGE_SIZE = 100;
+    const RESULT_STABLE_MS = 600;
+    const BATCH_OPEN_LIMIT = 30;
 
     const DEFAULT_RULES = {
         includeRegex: '',
@@ -139,6 +143,17 @@
     const saveRules = rules => GM_setValue(STORAGE_KEY, JSON.stringify(normalizeRules(rules)));
 
     let rules = getRules();
+    let extractionRunning = false;
+    let floatingRunButton = null;
+
+    const setExtractionRunning = running => {
+        extractionRunning = running;
+        if (!floatingRunButton) return;
+        floatingRunButton.disabled = running;
+        floatingRunButton.textContent = running ? '提取中…' : '提取URL';
+        floatingRunButton.style.opacity = running ? '0.65' : '1';
+        floatingRunButton.style.cursor = running ? 'wait' : 'pointer';
+    };
 
     // 安全正则，不弹 alert
     const safeRegex = pattern => {
@@ -190,8 +205,13 @@
         }
     };
 
+    const neutralizeSpreadsheetCell = value => {
+        const text = String(value ?? '');
+        return /^[=+\-@]/.test(text) ? `'${text}` : text;
+    };
+
     const escapeCsvCell = v => {
-        const text = String(v ?? '');
+        const text = neutralizeSpreadsheetCell(v);
         return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
     };
 
@@ -206,7 +226,7 @@
         const cols = getColumnsByKeys(columnKeys);
         const header = cols.map(c => c.text);
         const rows = records.map((r, idx) => cols.map(c => getColumnCellValue(c.key, r, idx)));
-        return [header, ...rows].map(row => row.map(v => String(v ?? '').replace(/[\t\r\n]+/g, ' ')).join('\t')).join('\n');
+        return [header, ...rows].map(row => row.map(v => neutralizeSpreadsheetCell(v).replace(/[\t\r\n]+/g, ' ')).join('\t')).join('\n');
     };
 
     const copyToClipboard = text => navigator.clipboard.writeText(text);
@@ -220,7 +240,15 @@
         document.body.appendChild(a);
         a.click();
         a.remove();
-        URL.revokeObjectURL(url);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+
+    const openBackgroundTab = url => {
+        if (typeof GM_openInTab === 'function') {
+            GM_openInTab(url, { active: false, insert: true, setParent: true });
+            return true;
+        }
+        return Boolean(window.open(url, '_blank', 'noopener,noreferrer'));
     };
 
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -284,6 +312,7 @@
 
     const makeBtn = (text, color = '#16a085', bg = '#fff') => {
         const btn = document.createElement('button');
+        btn.type = 'button';
         btn.textContent = text;
         Object.assign(btn.style, {
             padding: '8px 12px', borderRadius: '6px', border: `1px solid ${color}`,
@@ -301,8 +330,13 @@
         mask.addEventListener('click', e => { if (e.target === mask) mask.remove(); });
 
         const panel = document.createElement('div');
+        panel.setAttribute('role', 'dialog');
+        panel.setAttribute('aria-modal', 'true');
+        panel.setAttribute('aria-label', 'Quake URL 提取器');
+        panel.tabIndex = -1;
         Object.assign(panel.style, STYLES.modalPanel());
         mask.appendChild(panel);
+        requestAnimationFrame(() => { if (panel.isConnected) panel.focus(); });
         return { mask, panel };
     };
 
@@ -315,8 +349,13 @@
         mask.addEventListener('click', e => { if (e.target === mask) mask.remove(); });
 
         const panel = document.createElement('div');
+        panel.setAttribute('role', 'dialog');
+        panel.setAttribute('aria-modal', 'true');
+        panel.setAttribute('aria-label', 'Quake URL 提取器');
+        panel.tabIndex = -1;
         Object.assign(panel.style, STYLES.modalPanel(width));
         mask.appendChild(panel);
+        requestAnimationFrame(() => { if (panel.isConnected) panel.focus(); });
         return { mask, panel };
     };
 
@@ -382,7 +421,7 @@
     }
 
     function getPageSignature(selector) {
-        return Array.from(document.querySelectorAll(selector)).slice(0, 20)
+        return Array.from(document.querySelectorAll(selector))
             .map(a => a.getAttribute('href') || '').join('|');
     }
 
@@ -454,15 +493,26 @@
         btn.click();
 
         const changed = await waitForPageChange(r.resultLinkSelector, prev, r.pageWaitMs);
-        if (!changed) await sleep(r.pageWaitMs);
-        return true;
+        return changed;
     }
 
     async function waitForPageChange(selector, prevSignature, timeoutMs) {
         const start = Date.now();
+        let candidate = '';
+        let candidateSince = 0;
         while (Date.now() - start < timeoutMs) {
             const now = getPageSignature(selector);
-            if (now && now !== prevSignature) return true;
+            if (now && now !== prevSignature) {
+                if (now !== candidate) {
+                    candidate = now;
+                    candidateSince = Date.now();
+                } else if (Date.now() - candidateSince >= RESULT_STABLE_MS) {
+                    return true;
+                }
+            } else {
+                candidate = '';
+                candidateSince = 0;
+            }
             await sleep(200);
         }
         return false;
@@ -752,30 +802,32 @@
     }
 
     // 更新单行数据
-    function updateRow(table, url, checkResult, columns, records) {
+    function updateRow(table, url, checkResult, state) {
         const tbody = getTbody(table);
         if (!tbody) return;
 
-        const idx = records.findIndex(r => r.url === url);
-        if (idx === -1) return;
+        const idx = state.recordIndex.get(url);
+        if (idx === undefined) return;
 
-        records[idx] = {
-            ...records[idx],
+        state.records[idx] = {
+            ...state.records[idx],
             checkOk: checkResult.ok,
             checkStatus: checkResult.reason === '跳过校验' ? '跳过' : (checkResult.ok ? '可用' : '不可用'),
             checkReason: checkResult.reason
         };
 
-        const rowIndex = idx; // tbody rows are indexed directly
-        const tr = tbody.rows[rowIndex];
+        const pageStart = (state.page - 1) * state.pageSize;
+        if (idx < pageStart || idx >= pageStart + state.pageSize) return;
+        const tr = tbody.rows[idx - pageStart];
         if (!tr) return;
 
         // 更新 checkStatus 和 checkReason 列
+        const columns = getColumnsByKeys(state.visibleColumns);
         columns.forEach((c, colIdx) => {
             if (c.key === 'checkStatus' || c.key === 'checkReason') {
                 const td = tr.cells[colIdx];
                 if (td) {
-                    const value = getColumnCellValue(c.key, records[idx], idx);
+                    const value = getColumnCellValue(c.key, state.records[idx], idx);
                     td.textContent = String(value ?? '');
                     // 根据状态设置颜色
                     if (c.key === 'checkStatus') {
@@ -807,8 +859,11 @@
 
         // tbody
         const tbody = document.createElement('tbody');
-        state.records.forEach((row, idx) => {
-            tbody.appendChild(createRow(cols, row, idx));
+        const totalPages = Math.max(1, Math.ceil(state.records.length / state.pageSize));
+        state.page = Math.min(Math.max(1, state.page), totalPages);
+        const start = (state.page - 1) * state.pageSize;
+        state.records.slice(start, start + state.pageSize).forEach((row, offset) => {
+            tbody.appendChild(createRow(cols, row, start + offset));
         });
         table.appendChild(tbody);
     }
@@ -823,10 +878,12 @@
         table.appendChild(fragment);
     }
     // ============== 结果弹窗 ==============
-    function showResultModal({ allCount, filteredCount, finalRecords, checkedCount, availableCount, unavailableCount, pagesCollected, autoCheckDone = false }) {
+    function showResultModal({ allCount, finalRecords, checkedCount, availableCount, unavailableCount, pagesCollected }) {
         const { mask, panel } = createModal('quake-url-result-mask');
         const state = {
-            records: finalRecords.map(x => ({ ...x })),
+            rawRecords: finalRecords,
+            records: finalRecords,
+            prepared: false,
             checkedCount: checkedCount || 0,
             availableCount: availableCount || 0,
             unavailableCount: unavailableCount || 0,
@@ -835,11 +892,14 @@
             checkTrigger: rules.checkTrigger === 'auto' ? 'auto' : 'manual',
             visibleColumns: normalizeColumnKeys(rules.visibleColumns, DEFAULT_VISIBLE_COLUMNS),
             copyColumns: normalizeColumnKeys(rules.copyColumns, DEFAULT_COPY_COLUMNS),
+            page: 1,
+            pageSize: RESULT_PAGE_SIZE,
+            recordIndex: new Map(),
             checking: false,
-            autoCheckingPending: rules.checkTrigger === 'auto' && !autoCheckDone && finalRecords.length > 0,
+            autoCheckingPending: false,
             cancelFn: null
         };
-        const columns = getColumnsByKeys(state.visibleColumns);
+        state.recordIndex = new Map(state.records.map((record, index) => [record.url, index]));
 
         const makeField = (label, node) => {
             const box = document.createElement('label');
@@ -952,7 +1012,8 @@
         Object.assign(summary.style, STYLES.summary);
         const renderSummary = () => {
             const skipped = state.records.filter(x => x.checkStatus === '跳过').length;
-            summary.textContent = `采集: ${allCount} | 过滤后: ${filteredCount} | 最终: ${state.records.length} | 页数: ${pagesCollected} | 校验: ${state.checkedCount}/${filteredCount} | 可用: ${state.availableCount} | 不可用: ${state.unavailableCount}${skipped > 0 ? ` | 跳过: ${skipped}` : ''}`;
+            const preparedCount = state.prepared ? state.records.length : '待整理';
+            summary.textContent = `原始采集: ${allCount} | 整理后: ${preparedCount} | 页数: ${pagesCollected} | 校验: ${state.checkedCount}/${state.records.length} | 可用: ${state.availableCount} | 不可用: ${state.unavailableCount}${skipped > 0 ? ` | 跳过: ${skipped}` : ''}`;
         };
 
         // 内联配置区（默认折叠）
@@ -1076,6 +1137,8 @@
             borderRadius: '4px', transition: 'width 0.2s ease'
         });
         const progressText = document.createElement('div');
+        progressText.setAttribute('role', 'status');
+        progressText.setAttribute('aria-live', 'polite');
         Object.assign(progressText.style, {
             marginTop: '4px', fontSize: '12px', color: '#666', textAlign: 'center'
         });
@@ -1084,25 +1147,50 @@
 
         // Toolbar
         const toolbar = document.createElement('div');
-        Object.assign(toolbar.style, STYLES.toolbar);
+        Object.assign(toolbar.style, STYLES.toolbar, { flexWrap: 'wrap' });
 
         const colBtn = makeBtn('列设置', '#0f766e', '#fff');
+        const prepareBtn = makeBtn('整理结果', '#2d7df6', '#fff');
+        const rawJsonBtn = makeBtn('原始 JSON', '#64748b', '#fff');
         const checkBtn = makeBtn('', '#b45309', '#fff');
         const refreshCheckBtnLabel = () => {
             if (state.checking) {
                 return;
             }
-            checkBtn.textContent = state.autoCheckingPending ? '自动校验中...' : '开始校验';
+            checkBtn.textContent = !state.prepared ? '整理后可校验' : (state.autoCheckingPending ? '自动校验中...' : '开始校验');
         };
         refreshCheckBtnLabel();
-        if (state.autoCheckingPending) {
-            checkBtn.disabled = true;
-        }
+        checkBtn.disabled = true;
 
         const actionWrap = document.createElement('div');
         Object.assign(actionWrap.style, { display: 'inline-flex', gap: '8px' });
-        actionWrap.append(colBtn, checkBtn);
-        toolbar.appendChild(actionWrap);
+        actionWrap.append(prepareBtn, rawJsonBtn, colBtn, checkBtn);
+        const pageWrap = document.createElement('div');
+        Object.assign(pageWrap.style, { display: 'inline-flex', alignItems: 'center', gap: '8px' });
+        const pagePrev = makeBtn('上一页', '#64748b', '#fff');
+        const pageInfo = document.createElement('span');
+        Object.assign(pageInfo.style, { minWidth: '110px', textAlign: 'center', color: '#475569', fontSize: '12px' });
+        const pageNext = makeBtn('下一页', '#64748b', '#fff');
+        pageWrap.append(pagePrev, pageInfo, pageNext);
+        toolbar.append(actionWrap, pageWrap);
+
+        const renderTable = () => {
+            renderRows(table, state);
+            const totalPages = Math.max(1, Math.ceil(state.records.length / state.pageSize));
+            pageInfo.textContent = `${state.page} / ${totalPages}（每页 ${state.pageSize}）`;
+            pagePrev.disabled = state.page <= 1;
+            pageNext.disabled = state.page >= totalPages;
+        };
+        pagePrev.addEventListener('click', () => {
+            state.page -= 1;
+            renderTable();
+            tableWrap.scrollTop = 0;
+        });
+        pageNext.addEventListener('click', () => {
+            state.page += 1;
+            renderTable();
+            tableWrap.scrollTop = 0;
+        });
 
         // 配置展开/折叠时，控制表格区域和工具栏的显示（配置与表格互斥）
         configDetails.addEventListener('toggle', () => {
@@ -1183,7 +1271,7 @@
             state.autoCheckingPending = false;
             if (!state.checking) {
                 refreshCheckBtnLabel();
-                checkBtn.disabled = false;
+                checkBtn.disabled = !state.prepared || !state.records.length;
             }
             if (notifyOnSuccess) {
                 GM_notification({
@@ -1193,6 +1281,42 @@
             }
             return true;
         };
+
+        rawJsonBtn.addEventListener('click', () => {
+            const payload = JSON.stringify({
+                exported_at: new Date().toISOString(),
+                source: location.href,
+                pages_collected: pagesCollected,
+                raw_records: state.rawRecords
+            }, null, 2);
+            downloadAsTextFile(payload, `quake-url-raw-${Date.now()}.json`, 'application/json;charset=utf-8');
+        });
+
+        prepareBtn.addEventListener('click', () => {
+            if (state.checking || state.autoCheckingPending) return;
+            if (!saveInlineConfig(false)) return;
+            const runtimeRules = getRules();
+            state.records = applyRules(state.rawRecords, runtimeRules).slice().sort((a, b) => {
+                return a.page - b.page || a.host.localeCompare(b.host) || a.url.localeCompare(b.url);
+            });
+            state.prepared = true;
+            state.page = 1;
+            state.recordIndex = new Map(state.records.map((record, index) => [record.url, index]));
+            state.checkedCount = 0;
+            state.availableCount = state.records.filter(record => record.checkStatus === '可用').length;
+            state.unavailableCount = state.records.filter(record => record.checkStatus === '不可用').length;
+            state.autoCheckingPending = runtimeRules.checkTrigger === 'auto' && state.records.length > 0;
+            prepareBtn.textContent = '重新整理';
+            checkBtn.disabled = !state.records.length;
+            copyBtn.disabled = !state.records.length;
+            csvBtn.disabled = !state.records.length;
+            openAllBtn.disabled = !state.records.length;
+            openAvailableBtn.disabled = !state.records.length;
+            refreshCheckBtnLabel();
+            renderTable();
+            renderSummary();
+            if (state.autoCheckingPending) setTimeout(() => runCheck(), 100);
+        });
 
         resetCfgBtn.addEventListener('click', () => {
             applyRulesToConfigInputs(DEFAULT_RULES);
@@ -1225,9 +1349,7 @@
         Object.assign(table.style, STYLES.table);
         tableWrap.appendChild(table);
 
-        // 初始化表格
-        initTable(table, state.visibleColumns);
-        renderRows(table, state, columns);
+        renderTable();
 
         // Footer
         const footer = document.createElement('div');
@@ -1236,32 +1358,51 @@
         const closeBtn = makeBtn('关闭', '#999', '#fff');
         closeBtn.addEventListener('click', () => mask.remove());
 
+        const copyBtn = makeBtn('复制整理结果', '#0f766e', '#fff');
+        copyBtn.disabled = true;
+        copyBtn.addEventListener('click', () => {
+            if (!state.prepared || !state.records.length) return;
+            copyToClipboard(toTsv(state.records, state.copyColumns)).catch(error => {
+                console.error('[Quake URL 提取] 复制失败', error);
+            });
+        });
+
+        const csvBtn = makeBtn('导出 CSV', '#0f766e', '#fff');
+        csvBtn.disabled = true;
+        csvBtn.addEventListener('click', () => {
+            if (!state.prepared || !state.records.length) return;
+            downloadAsTextFile(`\uFEFF${toCsv(state.records, state.copyColumns)}`, `quake-url-${Date.now()}.csv`, 'text/csv;charset=utf-8');
+        });
+
+        const openBatch = (urls, label) => {
+            const allUrls = [...new Set(urls.filter(Boolean))];
+            if (!allUrls.length) return;
+            const selected = allUrls.slice(0, BATCH_OPEN_LIMIT);
+            const remainder = allUrls.length - selected.length;
+            const suffix = remainder > 0 ? `\n为避免浏览器卡顿，本次仅打开前 ${BATCH_OPEN_LIMIT} 个，剩余 ${remainder} 个未打开。` : '';
+            if (!window.confirm(`将在后台打开 ${selected.length} 个${label}。是否继续？${suffix}`)) return;
+            selected.forEach((url, index) => {
+                setTimeout(() => openBackgroundTab(url), index * 100);
+            });
+        };
+
         const openAvailableBtn = makeBtn('打开可用链接', '#16a085', '#fff');
+        openAvailableBtn.disabled = true;
         openAvailableBtn.addEventListener('click', () => {
             const availableUrls = state.records
                 .filter(r => r.checkStatus === '可用' && r.url)
                 .map(r => r.url);
-            if (!availableUrls.length) {
-                return;
-            }
-            // 逐个打开链接（使用延迟避免被浏览器阻止）
-            availableUrls.forEach((url, i) => {
-                setTimeout(() => window.open(url, '_blank', 'noopener,noreferrer'), i * 100);
-            });
+            openBatch(availableUrls, '可用链接');
         });
 
         const openAllBtn = makeBtn('打开全部链接', '#2d7df6', '#fff');
+        openAllBtn.disabled = true;
         openAllBtn.addEventListener('click', () => {
             const allUrls = state.records.filter(r => r.url).map(r => r.url);
-            if (!allUrls.length) {
-                return;
-            }
-            allUrls.forEach((url, i) => {
-                setTimeout(() => window.open(url, '_blank', 'noopener,noreferrer'), i * 100);
-            });
+            openBatch(allUrls, '链接');
         });
 
-        footer.append(openAllBtn, openAvailableBtn, closeBtn);
+        footer.append(copyBtn, csvBtn, openAllBtn, openAvailableBtn, closeBtn);
 
         // 列设置
         colBtn.addEventListener('click', () => {
@@ -1321,7 +1462,7 @@
                 runtimeRules.copyColumns = state.copyColumns;
                 saveRules(runtimeRules);
                 rules = runtimeRules;
-                renderRows(table, state);
+                renderTable();
                 cmask.remove();
             });
 
@@ -1332,25 +1473,23 @@
 
         // 实时更新单行的回调（同时更新标题和校验状态）
         const onRowResult = (url, result) => {
-            const idx = state.records.findIndex(r => r.url === url);
-            if (idx !== -1) {
+            const idx = state.recordIndex.get(url);
+            if (idx !== undefined) {
                 if (result.title && result.title.length > 2 && state.records[idx].title !== result.title) {
                     state.records[idx].title = result.title;
                 }
-                state.records[idx].checkOk = result.ok;
-                state.records[idx].checkStatus = result.ok ? '可用' : '不可用';
-                state.records[idx].checkReason = result.reason;
-                updateRow(table, url, result, columns, state.records);
+                updateRow(table, url, result, state);
             }
         };
 
         // 校验
         const runCheck = async () => {
-            if (!state.records.length) {
+            if (!state.prepared || !state.records.length) {
                 return;
             }
 
             state.checking = true;
+            prepareBtn.disabled = true;
             colBtn.disabled = true;
             checkBtn.disabled = false;
 
@@ -1379,16 +1518,23 @@
                 state.checkedCount = isCancelled ? state.checkedCount : c;
                 state.skippedCount = skipped || 0;
                 state.records = applyCheckResultToRecords(state.records, resultMap, true);
+                state.recordIndex = new Map(state.records.map((record, index) => [record.url, index]));
                 state.availableCount = state.records.filter(x => x.checkStatus === '可用').length;
                 state.unavailableCount = state.records.filter(x => x.checkStatus === '不可用').length;
-                renderRows(table, state, columns);
+                const hasRecords = state.records.length > 0;
+                copyBtn.disabled = !hasRecords;
+                csvBtn.disabled = !hasRecords;
+                openAllBtn.disabled = !hasRecords;
+                openAvailableBtn.disabled = !hasRecords;
+                renderTable();
                 renderSummary();
             } finally {
                 state.checking = false;
                 state.autoCheckingPending = false;
                 state.cancelFn = null;
+                prepareBtn.disabled = false;
                 colBtn.disabled = false;
-                checkBtn.disabled = false;
+                checkBtn.disabled = !state.records.length;
                 refreshCheckBtnLabel();
                 showProgress(0, 0, false);
             }
@@ -1437,34 +1583,38 @@
 
     // ============== 主流程 ==============
     async function runExtractFlow() {
-        rules = getRules();
+        if (extractionRunning) {
+            GM_notification({ text: '已有采集任务正在运行，请等待完成', title: 'Quake URL 提取' });
+            return;
+        }
+        setExtractionRunning(true);
+        try {
+            rules = getRules();
+            try {
+                document.querySelectorAll(rules.resultLinkSelector);
+                document.querySelector(rules.nextPageSelector);
+            } catch (error) {
+                throw new Error(`页面选择器无效：${error instanceof Error ? error.message : String(error)}`);
+            }
 
-        const collected = await collectRecords(rules);
-        const filtered = applyRules(collected, rules);
+            const collected = await collectRecords(rules);
+            const pagesCollected = collected.length > 0 ? Math.max(...collected.map(x => x.page)) : 0;
 
-        let finalRecords = filtered.map(x => ({ ...x }));
-        let checkedCount = 0;
-        let availableCount = 0;
-        let unavailableCount = 0;
-        let autoCheckDone = false;
-
-        // 自动校验模式：先弹窗显示URL，用户在弹窗中触发校验
-        // 注意：不再在提取时做校验，校验完全在弹窗中进行
-
-        const pagesCollected = finalRecords.length > 0
-            ? Math.max(...finalRecords.map(x => x.page))
-            : (collected.length > 0 ? Math.max(...collected.map(x => x.page)) : 0);
-
-        showResultModal({
-            allCount: collected.length,
-            filteredCount: filtered.length,
-            finalRecords,
-            checkedCount,
-            availableCount,
-            unavailableCount,
-            pagesCollected,
-            autoCheckDone
-        });
+            showResultModal({
+                allCount: collected.length,
+                finalRecords: collected,
+                checkedCount: 0,
+                availableCount: 0,
+                unavailableCount: 0,
+                pagesCollected
+            });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error('[Quake URL 提取]', error);
+            GM_notification({ text: `提取失败：${message}`, title: 'Quake URL 提取' });
+        } finally {
+            setExtractionRunning(false);
+        }
     }
 
     // ============== 初始化 ==============
@@ -1476,6 +1626,7 @@
         });
 
         const runBtn = document.createElement('button');
+        floatingRunButton = runBtn;
         runBtn.textContent = '提取URL';
         Object.assign(runBtn.style, {
             padding: '10px 14px', borderRadius: '8px', border: '1px solid #16a085',

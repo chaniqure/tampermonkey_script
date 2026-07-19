@@ -100,7 +100,7 @@ test('normalizeSettings clamps unsafe pagination values', () => {
   const { normalizeSettings } = loadTestApi();
   const settings = normalizeSettings({
     maxPages: '0',
-    targetDomains: '-12',
+    targetRecords: '-12',
     pageWaitMs: '200',
     pageDelayMinMs: '3000',
     pageDelayMaxMs: '1000',
@@ -108,7 +108,7 @@ test('normalizeSettings clamps unsafe pagination values', () => {
   });
 
   assert.equal(settings.maxPages, 1);
-  assert.equal(settings.targetDomains, 0);
+  assert.equal(settings.targetRecords, 0);
   assert.equal(settings.pageWaitMs, 1500);
   assert.equal(settings.pageDelayMinMs, 1000);
   assert.equal(settings.pageDelayMaxMs, 3000);
@@ -130,9 +130,11 @@ test('page transition state only changes for a non-empty new page', () => {
   const { pageStateChanged, samePageState } = loadTestApi();
   const firstPage = { pageNumber: 1, resultCount: 10, signature: 'a|b' };
   const loading = { pageNumber: 0, resultCount: 0, signature: '' };
+  const pageNumberOnly = { pageNumber: 2, resultCount: 10, signature: 'a|b' };
   const secondPage = { pageNumber: 2, resultCount: 10, signature: 'c|d' };
 
   assert.equal(pageStateChanged(firstPage, loading), false);
+  assert.equal(pageStateChanged(firstPage, pageNumberOnly), false);
   assert.equal(pageStateChanged(firstPage, secondPage), true);
   assert.equal(samePageState(secondPage, { ...secondPage }), true);
   assert.equal(samePageState(secondPage, { ...secondPage, resultCount: 3 }), false);
