@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FOFA 域名资产提取与人工审核
 // @namespace    local.codex.fofa
-// @version      1.0.1
+// @version      1.1.0
 // @description  跨页提取 FOFA 搜索结果中的主机/域名，聚合展示、批量打开并由用户人工标记可用性。翻页默认随机间隔 1–3 秒。
 // @author       you
 // @match        *://fofa.info/*
@@ -260,8 +260,10 @@
   const state = {
     settings: normalizeSettings(readStoredJson(SETTINGS_KEY, DEFAULT_SETTINGS)),
     reviews: readStoredJson(REVIEWS_KEY, {}),
+    rawRecords: [],
     records: [],
     assets: [],
+    prepared: false,
     running: false,
     cancelled: false,
     pagesCollected: 0,
@@ -411,7 +413,6 @@
 
   function extractRecordsFromCurrentPage(fallbackPage) {
     const page = getActivePageNumber() || fallbackPage;
-    const seen = new Set();
     const records = [];
     for (const anchor of document.querySelectorAll(RESULT_LINK_SELECTOR)) {
       const rawHref = anchor.getAttribute('href') || normalizeText(anchor.textContent);
@@ -424,8 +425,7 @@
         continue;
       }
       const domain = extractDomainFromUrl(url.href);
-      if (!domain || seen.has(url.href)) continue;
-      seen.add(url.href);
+      if (!domain) continue;
       records.push({
         domain,
         page,
@@ -439,16 +439,33 @@
     return records;
   }
 
-  function mergePageRecords(records) {
-    const existing = new Set(state.records.map((record) => `${record.page}\n${record.url}`));
-    for (const record of records) {
+  function appendPageRecords(records) {
+    state.rawRecords.push(...records);
+  }
+
+  function dedupeHostRecords(records) {
+    const recordsByKey = new Map();
+    for (const record of records || []) {
       const key = `${record.page}\n${record.url}`;
-      if (!existing.has(key)) {
-        existing.add(key);
-        state.records.push(record);
-      }
+      if (!recordsByKey.has(key)) recordsByKey.set(key, { ...record });
     }
+    return [...recordsByKey.values()].sort((a, b) => {
+      return a.page - b.page || a.domain.localeCompare(b.domain) || a.url.localeCompare(b.url);
+    });
+  }
+
+  function prepareResults() {
+    if (state.running || !state.rawRecords.length) {
+      setStatus(state.running ? '请等待采集结束后再整理结果' : '暂无原始记录，请先开始采集', 'warning');
+      return;
+    }
+    setStatus(`正在整理 ${state.rawRecords.length} 条原始记录…`, 'working');
+    state.records = dedupeHostRecords(state.rawRecords);
     state.assets = aggregateDomainRecords(state.records);
+    state.prepared = true;
+    updateStats();
+    setStatus(`整理完成：${state.rawRecords.length} 条原始记录去重为 ${state.records.length} 条，聚合得到 ${state.assets.length} 个主机`, 'success');
+    openResultView();
   }
 
   function settingsFromUi() {
@@ -483,9 +500,10 @@
   function updateStats() {
     if (!state.ui) return;
     state.ui.pageCount.textContent = String(state.pagesCollected);
-    state.ui.recordCount.textContent = String(state.records.length);
+    state.ui.recordCount.textContent = String(state.rawRecords.length);
     state.ui.domainCount.textContent = String(state.assets.length);
-    const hasResults = state.assets.length > 0;
+    state.ui.prepare.disabled = state.running || !state.rawRecords.length;
+    const hasResults = state.prepared && state.assets.length > 0;
     for (const button of state.ui.resultActions) button.disabled = !hasResults || state.running;
     if (!state.ui.resultOverlay.hidden) renderResults();
   }
@@ -495,14 +513,17 @@
     state.ui.start.hidden = running;
     state.ui.stop.hidden = !running;
     state.ui.settingsFieldset.disabled = running;
+    state.ui.prepare.disabled = running || !state.rawRecords.length;
     updateStats();
   }
 
   async function runExtraction() {
     if (state.running) return;
     saveSettingsFromUi();
+    state.rawRecords = [];
     state.records = [];
     state.assets = [];
+    state.prepared = false;
     state.pagesCollected = 0;
     state.cancelled = false;
     state.resultView.page = 1;
@@ -518,17 +539,17 @@
 
       for (let step = 1; step <= state.settings.maxPages && !state.cancelled; step += 1) {
         const pageRecords = extractRecordsFromCurrentPage(step);
-        mergePageRecords(pageRecords);
+        appendPageRecords(pageRecords);
         state.pagesCollected += 1;
         updateStats();
-        setStatus(`第 ${getActivePageNumber() || step} 页完成：本页 ${pageRecords.length} 条主机记录，累计 ${state.assets.length} 个主机`, 'working');
+        setStatus(`第 ${getActivePageNumber() || step} 页完成：本页 ${pageRecords.length} 条原始记录，累计 ${state.rawRecords.length} 条`, 'working');
 
-        if (state.settings.targetDomains > 0 && state.assets.length >= state.settings.targetDomains) {
-          setStatus(`已达到目标主机数 ${state.settings.targetDomains}，采集完成`, 'success');
+        if (state.settings.targetDomains > 0 && state.rawRecords.length >= state.settings.targetDomains) {
+          setStatus(`已达到目标原始记录数 ${state.settings.targetDomains}，采集完成。请点击“整理结果”`, 'success');
           break;
         }
         if (!state.settings.autoPaginate || step >= state.settings.maxPages) {
-          setStatus(`采集完成：${state.pagesCollected} 页、${state.assets.length} 个主机`, 'success');
+          setStatus(`采集完成：${state.pagesCollected} 页、${state.rawRecords.length} 条原始记录。请点击“整理结果”`, 'success');
           break;
         }
 
@@ -540,16 +561,15 @@
         setStatus(`已完成 ${state.pagesCollected} 页，正在切换下一页…`, 'working');
         const nextState = await gotoNextPage();
         if (!nextState) {
-          setStatus(`已到末页或翻页未在 ${state.settings.pageWaitMs}ms 内稳定，共提取 ${state.assets.length} 个主机`, state.assets.length ? 'success' : 'warning');
+          setStatus(`已到末页或翻页未在 ${state.settings.pageWaitMs}ms 内稳定，共采集 ${state.rawRecords.length} 条原始记录。请点击“整理结果”`, state.rawRecords.length ? 'success' : 'warning');
           break;
         }
       }
 
-      if (state.cancelled) setStatus(`已停止，保留已提取的 ${state.assets.length} 个主机`, 'warning');
-      if (state.assets.length) openResultView();
+      if (state.cancelled) setStatus(`已停止，保留 ${state.rawRecords.length} 条原始记录，可点击“整理结果”`, 'warning');
     } catch (error) {
       console.error('[FOFA 域名审核台] 提取失败', error);
-      setStatus(`提取失败：${error.message || error}`, 'error');
+      setStatus(`采集中断：${error.message || error}。已保留 ${state.rawRecords.length} 条原始记录，可点击“整理结果”`, 'error');
     } finally {
       setRunning(false);
     }
@@ -763,6 +783,8 @@
       exported_at: new Date().toISOString(),
       source: location.href,
       pages_collected: state.pagesCollected,
+      raw_records: state.rawRecords.length,
+      records_after_deduplication: state.records.length,
       domains: state.assets.map((asset) => ({ ...asset, review: getReview(asset.domain) })),
     }, null, 2);
   }
@@ -1008,8 +1030,8 @@
         <div class="query"><span class="query-label">QUERY</span><span class="query-value"></span></div>
         <div class="stats">
           <div class="stat"><strong data-stat="pages">0</strong><span>已采集页</span></div>
-          <div class="stat"><strong data-stat="records">0</strong><span>主机记录</span></div>
-          <div class="stat"><strong data-stat="domains">0</strong><span>聚合主机</span></div>
+          <div class="stat"><strong data-stat="records">0</strong><span>原始记录</span></div>
+          <div class="stat"><strong data-stat="domains">0</strong><span>整理主机</span></div>
         </div>
         <div class="status" data-tone="idle">等待从当前 FOFA 结果页提取</div>
         <fieldset class="settings">
@@ -1020,7 +1042,7 @@
             <summary>采集范围与等待设置</summary>
             <div class="setting-grid">
               <label class="setting-field">最多页数<input type="number" min="1" max="200" data-setting="maxPages"></label>
-              <label class="setting-field">目标主机（0=不限）<input type="number" min="0" max="100000" data-setting="targetDomains"></label>
+              <label class="setting-field">目标原始记录（0=不限）<input type="number" min="0" max="100000" data-setting="targetDomains"></label>
               <label class="setting-field">结果稳定等待 ms<input type="number" min="1500" max="30000" step="500" data-setting="pageWaitMs"></label>
               <label class="setting-field">翻页间隔最小 ms<input type="number" min="0" max="60000" step="100" data-setting="pageDelayMinMs"></label>
               <label class="setting-field">翻页间隔最大 ms<input type="number" min="0" max="60000" step="100" data-setting="pageDelayMaxMs"></label>
@@ -1030,6 +1052,7 @@
         <div class="actions">
           <button class="button primary" type="button" data-action="start">开始提取全部主机</button>
           <button class="button stop" type="button" data-action="stop" hidden>停止提取</button>
+          <button class="button primary" type="button" data-action="prepare" disabled>整理结果</button>
           <button class="button" type="button" data-action="copy" disabled>复制主机</button>
         </div>
         <div class="result-actions">
@@ -1076,6 +1099,7 @@
       resultOverlay,
       start: get('[data-action="start"]'),
       stop: get('[data-action="stop"]'),
+      prepare: get('[data-action="prepare"]'),
       status: get('.status'),
       settingsFieldset: get('.settings'),
       autoPaginate: get('[data-setting="autoPaginate"]'),
@@ -1185,6 +1209,7 @@
       launcher.hidden = false;
     });
     state.ui.start.addEventListener('click', runExtraction);
+    state.ui.prepare.addEventListener('click', prepareResults);
     state.ui.stop.addEventListener('click', () => {
       state.cancelled = true;
       setStatus('正在停止，等待当前翻页操作结束…', 'warning');

@@ -6,10 +6,10 @@
 
 | 脚本 | 目标站点 | 说明 | 版本 |
 |------|----------|------|------|
-| [`fofa-domain-extractor.user.js`](./fofa-domain-extractor.user.js) | FOFA | 跨页提取主机（域名 + IP），聚合审核，**不做网络探活** | 1.0.1 |
-| [`quake360-domain-extractor.user.js`](./quake360-domain-extractor.user.js) | Quake 360 | 跨页提取域名，聚合审核，**不做网络探活**（推荐） | 1.0.1 |
+| [`fofa-domain-extractor.user.js`](./fofa-domain-extractor.user.js) | FOFA | 跨页采集主机（域名 + IP），采集后手动整理与审核，**不做网络探活** | 1.1.0 |
+| [`quake360-domain-extractor.user.js`](./quake360-domain-extractor.user.js) | Quake 360 | 跨页提取域名，采集后手动整理与审核，**不做网络探活**（推荐） | 1.1.0 |
 | [`quake360_extract_url.js`](./quake360_extract_url.js) | Quake 360 | 旧版：按 URL 提取，支持自动可用性检测 | 1.4.2 |
-| [`threatbook-asset-extractor.user.js`](./threatbook-asset-extractor.user.js) | 微步 ThreatBook | 从 IP / 域名情报页提取关联域名与 IP | 1.2.1 |
+| [`threatbook-asset-extractor.user.js`](./threatbook-asset-extractor.user.js) | 微步 ThreatBook | 从 IP / 域名情报页采集关联资产，采集后手动整理 | 1.3.0 |
 
 Quake 建议优先使用新版域名审核脚本；旧版 URL 脚本仍保留，适合需要自动探活的场景。
 
@@ -53,9 +53,10 @@ Quake 建议优先使用新版域名审核脚本；旧版 URL 脚本仍保留，
 ## 使用提示
 
 1. 先在目标平台完成检索或打开情报页，再点「开始提取」
-2. 采集过程中可随时停止；已提取结果会保留
-3. 批量打开前请确认环境隔离，目标站点可能存在恶意或失陷资产
-4. 若站点改版导致选择器失效，需要同步更新脚本中的 DOM 选择器
+2. FOFA、微步与新版 Quake 在采集阶段只保存原始记录；采集结束后点击「整理结果」执行去重、聚合和排序
+3. 采集过程中可随时停止；已采集的原始记录会保留，仍可手动整理
+4. 批量打开前请确认环境隔离，目标站点可能存在恶意或失陷资产
+5. 若站点改版导致选择器失效，需要同步更新脚本中的 DOM 选择器
 
 ## 开发与测试
 

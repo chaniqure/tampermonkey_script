@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微步关联资产提取器
 // @namespace    local.codex.threatbook
-// @version      1.2.1
+// @version      1.3.0
 // @description  提取微步 IP/域名情报页面中的关联域名和 IP，并导出 CSV/JSON。表格翻页默认随机间隔 1–3 秒。
 // @author       Codex
 // @match        https://x.threatbook.com/v5/ip/*
@@ -64,7 +64,14 @@
   const state = {
     running: false,
     cancelled: false,
-    records: new Map(),
+    rawRecords: [],
+    records: [],
+    recordItems: [],
+    domainAssets: [],
+    ipAssets: [],
+    domains: [],
+    ips: [],
+    prepared: false,
     errors: [],
     originalTab: '',
     query: readQuery(),
@@ -202,16 +209,7 @@
       row_text: input.row_text || '',
     };
     if (!record.domain && !record.ip) return;
-    const key = [record.source, record.domain, record.ip, record.observed_at].join('|');
-    const previous = state.records.get(key);
-    if (previous) {
-      for (const field of ['verdict', 'location', 'provider', 'usage', 'row_text']) {
-        if (!previous[field] && record[field]) previous[field] = record[field];
-      }
-      return;
-    }
-    state.records.set(key, record);
-    updateStats();
+    state.rawRecords.push(record);
   }
 
   function extractRow(row, headers, source, observedAtOverride = '') {
@@ -342,6 +340,7 @@
       }
 
       visited += 1;
+      updateStats();
       if (state.cancelled) break;
       const pagination = scope.querySelector('.x-antd-comp-pagination');
       const next = pagination?.querySelector('.x-antd-comp-pagination-next');
@@ -524,7 +523,14 @@
 
     state.running = true;
     state.cancelled = false;
-    state.records.clear();
+    state.rawRecords = [];
+    state.records = [];
+    state.recordItems = [];
+    state.domainAssets = [];
+    state.ipAssets = [];
+    state.domains = [];
+    state.ips = [];
+    state.prepared = false;
     state.errors = [];
     state.originalTab = document.querySelector('#analysisControllUl > li.active')?.getAttribute('data-tab-name') || '';
     setControlsRunning(true);
@@ -538,13 +544,13 @@
         await crawlDomainResolution();
         await crawlSubdomains();
       }
-      setStatus(`提取完成，共 ${state.records.size} 条关联记录`, state.errors.length ? 'warning' : 'success');
+      setStatus(`采集完成，共 ${state.rawRecords.length} 条原始记录。请点击“整理结果”执行去重和排序`, state.errors.length ? 'warning' : 'success');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (state.cancelled) setStatus('已停止，当前结果仍可导出', 'warning');
+      if (state.cancelled) setStatus(`已停止，保留 ${state.rawRecords.length} 条原始记录，可点击“整理结果”`, 'warning');
       else {
         state.errors.push(message);
-        setStatus(`提取中断：${message}`, 'error');
+        setStatus(`采集中断：${message}。已保留 ${state.rawRecords.length} 条原始记录，可点击“整理结果”`, 'error');
         console.error('[微步关联资产提取器]', error);
       }
     } finally {
@@ -564,13 +570,47 @@
   }
 
   function recordsArray() {
-    return [...state.records.values()].sort((a, b) => {
+    return state.records;
+  }
+
+  function distinctAssets(field) {
+    return field === 'domain' ? state.domains : state.ips;
+  }
+
+  function prepareCollectedRecords(rawRecords) {
+    const recordsByKey = new Map();
+    for (const record of rawRecords) {
+      const key = [record.source, record.domain, record.ip, record.observed_at].join('|');
+      const previous = recordsByKey.get(key);
+      if (previous) {
+        for (const field of ['verdict', 'location', 'provider', 'usage', 'row_text']) {
+          if (!previous[field] && record[field]) previous[field] = record[field];
+        }
+      } else {
+        recordsByKey.set(key, { ...record });
+      }
+    }
+    return [...recordsByKey.values()].sort((a, b) => {
       return a.source.localeCompare(b.source) || a.domain.localeCompare(b.domain) || a.ip.localeCompare(b.ip) || b.observed_at.localeCompare(a.observed_at);
     });
   }
 
-  function distinctAssets(field) {
-    return unique(recordsArray().map((record) => record[field])).sort();
+  function prepareResults() {
+    if (state.running || !state.rawRecords.length) {
+      setStatus(state.running ? '请等待采集结束后再整理结果' : '暂无原始记录，请先开始采集', 'warning');
+      return;
+    }
+    setStatus(`正在整理 ${state.rawRecords.length} 条原始记录…`, 'working');
+    state.records = prepareCollectedRecords(state.rawRecords);
+    state.recordItems = state.records.map((record, index) => ({ ...record, kind: 'record', resultIndex: index }));
+    state.domainAssets = aggregateAssets('domain');
+    state.ipAssets = aggregateAssets('ip');
+    state.domains = state.domainAssets.map((entry) => entry.value);
+    state.ips = state.ipAssets.map((entry) => entry.value);
+    state.prepared = true;
+    updateStats();
+    setStatus(`整理完成：${state.rawRecords.length} 条原始记录去重为 ${state.records.length} 条，得到 ${state.domains.length} 个域名和 ${state.ips.length} 个 IP`, 'success');
+    openResultView();
   }
 
   function csvCell(value) {
@@ -594,7 +634,8 @@
       page_url: location.href,
       generated_at: new Date().toISOString(),
       summary: {
-        records: state.records.size,
+        raw_records: state.rawRecords.length,
+        records: state.records.length,
         domains: distinctAssets('domain').length,
         ips: distinctAssets('ip').length,
       },
@@ -611,8 +652,8 @@
   }
 
   function download(content, extension, mimeType) {
-    if (!state.records.size) {
-      setStatus('暂无结果，请先开始提取', 'warning');
+    if (!state.prepared || !state.records.length) {
+      setStatus('结果尚未整理，请先点击“整理结果”', 'warning');
       return;
     }
     const blob = new Blob([content], { type: mimeType });
@@ -788,9 +829,9 @@
   function filteredResultItems() {
     const { tab, query, review } = state.resultView;
     let items;
-    if (tab === 'domains') items = aggregateAssets('domain');
-    else if (tab === 'ips') items = aggregateAssets('ip');
-    else items = recordsArray().map((record, index) => ({ ...record, kind: 'record', resultIndex: index }));
+    if (tab === 'domains') items = state.domainAssets;
+    else if (tab === 'ips') items = state.ipAssets;
+    else items = state.recordItems;
 
     const keyword = normalizeText(query).toLowerCase();
     return items.filter((item) => {
@@ -954,7 +995,7 @@
     state.ui.resultPrev.disabled = state.resultView.page <= 1;
     state.ui.resultNext.disabled = state.resultView.page >= totalPages;
 
-    const counts = { domains: distinctAssets('domain').length, ips: distinctAssets('ip').length, records: state.records.size };
+    const counts = { domains: state.domains.length, ips: state.ips.length, records: state.records.length };
     for (const button of state.ui.resultTabs) {
       const active = button.dataset.resultTab === state.resultView.tab;
       button.classList.toggle('active', active);
@@ -974,8 +1015,8 @@
   }
 
   function openResultView() {
-    if (!state.records.size) {
-      setStatus('暂无结果，请先开始提取', 'warning');
+    if (!state.prepared || !state.records.length) {
+      setStatus('结果尚未整理，请先点击“整理结果”', 'warning');
       return;
     }
     state.ui.resultOverlay.hidden = false;
@@ -991,10 +1032,11 @@
 
   function updateStats() {
     if (!state.ui) return;
-    state.ui.recordCount.textContent = String(state.records.size);
-    state.ui.domainCount.textContent = String(distinctAssets('domain').length);
-    state.ui.ipCount.textContent = String(distinctAssets('ip').length);
-    const enabled = state.records.size > 0 && !state.running;
+    state.ui.recordCount.textContent = String(state.rawRecords.length);
+    state.ui.domainCount.textContent = String(state.domains.length);
+    state.ui.ipCount.textContent = String(state.ips.length);
+    state.ui.prepare.disabled = state.running || !state.rawRecords.length;
+    const enabled = state.prepared && state.records.length > 0 && !state.running;
     for (const button of state.ui.resultButtons) button.disabled = !enabled;
     if (!state.ui.resultOverlay.hidden && !state.running) renderResultView();
   }
@@ -1012,6 +1054,7 @@
     state.ui.includeInactive.disabled = running;
     state.ui.pageDelayMinMs.disabled = running;
     state.ui.pageDelayMaxMs.disabled = running;
+    state.ui.prepare.disabled = running || !state.rawRecords.length;
     updateStats();
   }
 
@@ -1219,9 +1262,9 @@
       <div class="body">
         <div class="query"><span class="badge"></span><span class="query-value"></span></div>
         <div class="stats">
-          <div class="stat"><strong class="number" data-stat="records">0</strong><span class="label">关联记录</span></div>
-          <div class="stat"><strong class="number" data-stat="domains">0</strong><span class="label">域名</span></div>
-          <div class="stat"><strong class="number" data-stat="ips">0</strong><span class="label">IP</span></div>
+          <div class="stat"><strong class="number" data-stat="records">0</strong><span class="label">原始记录</span></div>
+          <div class="stat"><strong class="number" data-stat="domains">0</strong><span class="label">整理域名</span></div>
+          <div class="stat"><strong class="number" data-stat="ips">0</strong><span class="label">整理 IP</span></div>
         </div>
         <div class="status" data-tone="idle">等待提取</div>
         <div class="options">
@@ -1235,6 +1278,7 @@
         <div class="actions">
           <button class="button primary" data-action="start" type="button">开始提取</button>
           <button class="button danger" data-action="stop" type="button" hidden>停止</button>
+          <button class="button primary" data-action="prepare" type="button" disabled>整理结果</button>
           <button class="button" data-action="csv" type="button" disabled>CSV</button>
           <button class="button" data-action="json" type="button" disabled>JSON</button>
         </div>
@@ -1307,6 +1351,7 @@
       panel,
       start: get('[data-action="start"]'),
       stop: get('[data-action="stop"]'),
+      prepare: get('[data-action="prepare"]'),
       status: get('.status'),
       recordCount: get('[data-stat="records"]'),
       domainCount: get('[data-stat="domains"]'),
@@ -1411,6 +1456,7 @@
       launcher.hidden = false;
     });
     state.ui.start.addEventListener('click', runExtraction);
+    state.ui.prepare.addEventListener('click', prepareResults);
     state.ui.stop.addEventListener('click', () => {
       state.cancelled = true;
       setStatus('正在停止…', 'warning');
