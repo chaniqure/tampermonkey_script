@@ -72,15 +72,14 @@ Quake 建议优先使用新版域名审核脚本；旧版 URL 脚本仍保留，
 仓库为「脚本即产品」结构，无构建步骤。推荐在 `main` 分支直接开发与提交。
 
 ```bash
-# 语法检查
-node --check fofa-domain-extractor.user.js
-node --check quake360-domain-extractor.user.js
-node --check quake360_extract_url.js
-node --check threatbook-asset-extractor.user.js
+# 一键执行语法检查与单元测试
+npm run verify
 
-# 单测（纯函数）
-node --test tests/fofa-domain-extractor.test.js
-node --test tests/quake360-domain-extractor.test.js
+# 单独执行语法检查
+npm run check
+
+# 单独执行单元测试（纯函数）
+npm test
 ```
 
 FOFA / Quake 新版脚本在 `__FDX_TEST_MODE__` / `__QDX_TEST_MODE__` 下会暴露纯函数 API，供 Node 测试加载。
@@ -95,6 +94,7 @@ FOFA / Quake 新版脚本在 `__FDX_TEST_MODE__` / `__QDX_TEST_MODE__` 下会暴
 ├── quake360-domain-extractor.user.js      # Quake 域名提取与审核（新版）
 ├── quake360_extract_url.js                # Quake URL 提取与探活（旧版）
 ├── threatbook-asset-extractor.user.js     # 微步关联资产提取
+├── package.json                           # 检查与测试脚本入口
 ├── tests/                                 # Node 单测
 └── docs/plans/                            # 实现计划
 ```

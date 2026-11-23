@@ -1,9 +1,15 @@
-### Example user template template
-### Example user template
-
 # IntelliJ project files
-.idea
+.idea/
 *.iml
-out
-gen
+out/
+gen/
+
+# Editor / AI tool state
 .ace-tool/
+.agents/
+.cursor/
+
+# Node / OS
+node_modules/
+.DS_Store
+Thumbs.db

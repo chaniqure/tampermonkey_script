@@ -1,0 +1,11 @@
+{
+  "name": "tampermonkey-script",
+  "version": "1.0.0",
+  "private": true,
+  "description": "面向情报 / 资产测绘平台的 Tampermonkey 用户脚本集合",
+  "scripts": {
+    "check": "node --check fofa-domain-extractor.user.js && node --check quake360-domain-extractor.user.js && node --check quake360_extract_url.js && node --check threatbook-asset-extractor.user.js",
+    "test": "node --test tests/fofa-domain-extractor.test.js tests/quake360-domain-extractor.test.js",
+    "verify": "npm run check && npm test"
+  }
+}
